@@ -25,4 +25,4 @@ def scrape_recent_judgments(limit: int = 5) -> int:
     try:
         pages = crawl_url(ZIMLII_JUDGMENTS, limit=limit)
         for page in pages:
-            url = page.get("metadata",
+            url = page.get("metadata"),

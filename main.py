@@ -4,9 +4,7 @@ Runs scrapers on a schedule and pushes new legal content to MutemoOS V2.
 """
 import os
 import sys
-from dotenv import load_dotenv
 
-load_dotenv()
 
 # Validate required env vars before starting
 required = ["FIRECRAWL_API_KEY", "MUTEMO_API_URL", "MUTEMO_ADMIN_TOKEN"]

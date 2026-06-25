@@ -1,5 +1,5 @@
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["pip3 install -r requirements.txt"]
 
 [start]
-cmd = "python main.py"
+cmd = "python3 main.py"

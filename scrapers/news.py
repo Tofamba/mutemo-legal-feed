@@ -1,22 +1,80 @@
 """
-Zimbabwe legal news scraper
-Monitors 6 news sources for legal, court, and regulatory stories.
-Schedule: runs after ZimLII, Veritas, LRF — add to scheduler at 05:30 UTC (~7:30am CAT)
+scrapers/news.py — Zimbabwe legal news scraper (Phase 3).
+
+Monitors 6 Zimbabwean news sources for legal, court, and regulatory stories.
+Schedule: 05:30 UTC (07:30 CAT) — runs after ZimLII, Veritas, LRF.
 
 Sources:
-  - NewsDay (newsday.co.zw)
-  - The Herald (herald.co.zw)
+  - NewsDay         (newsday.co.zw)
+  - The Herald      (herald.co.zw)
   - Financial Gazette (fingaz.co.zw)
   - Zimbabwe Independent (theindependent.co.zw)
-  - Chronicle (chronicle.co.zw)
+  - Chronicle       (chronicle.co.zw)
   - Business Weekly (businessweekly.co.zw)
-"""
-import re
-from firecrawl_client import crawl_url, scrape_url
-from state import is_seen, mark_seen, mark_run
-from pusher import push_legal_update
 
-# Legal keywords to filter relevant articles
+Strategy:
+1. Scrape the news listing/homepage of each source via Firecrawl basic proxy
+2. Extract article URLs from the markdown
+3. Filter by legal keywords — only articles relevant to legal practice
+4. For each new URL, scrape the full article
+5. Return NewsItem objects for pushing to MutemoOS as Legal Updates
+   (source_type: "news")
+
+Credit budget: 1 credit/listing × 6 sources + 1 credit/article × up to 10 = ~16 credits/run
+"""
+
+import logging
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from firecrawl_client import scrape_markdown, FirecrawlError
+import state
+
+logger = logging.getLogger(__name__)
+
+# News sources — listing URLs that return the most recent articles
+NEWS_SOURCES = [
+    {
+        "name": "NewsDay",
+        "listing_url": "https://www.newsday.co.zw/",
+        "base_url": "https://www.newsday.co.zw",
+        "article_pattern": re.compile(r"https://www\.newsday\.co\.zw/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/?"),
+    },
+    {
+        "name": "The Herald",
+        "listing_url": "https://www.herald.co.zw/",
+        "base_url": "https://www.herald.co.zw",
+        "article_pattern": re.compile(r"https://www\.herald\.co\.zw/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/?"),
+    },
+    {
+        "name": "Financial Gazette",
+        "listing_url": "https://www.fingaz.co.zw/",
+        "base_url": "https://www.fingaz.co.zw",
+        "article_pattern": re.compile(r"https://www\.fingaz\.co\.zw/[a-z0-9\-/]+/?"),
+    },
+    {
+        "name": "Zimbabwe Independent",
+        "listing_url": "https://www.theindependent.co.zw/",
+        "base_url": "https://www.theindependent.co.zw",
+        "article_pattern": re.compile(r"https://www\.theindependent\.co\.zw/[a-z0-9\-/]+/?"),
+    },
+    {
+        "name": "Chronicle",
+        "listing_url": "https://www.chronicle.co.zw/",
+        "base_url": "https://www.chronicle.co.zw",
+        "article_pattern": re.compile(r"https://www\.chronicle\.co\.zw/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/?"),
+    },
+    {
+        "name": "Business Weekly",
+        "listing_url": "https://businessweekly.co.zw/",
+        "base_url": "https://businessweekly.co.zw",
+        "article_pattern": re.compile(r"https://businessweekly\.co\.zw/[a-z0-9\-/]+/?"),
+    },
+]
+
+# Legal keywords — article must contain at least one to be included
 LEGAL_KEYWORDS = [
     "court", "judge", "judgment", "magistrate", "high court", "supreme court",
     "constitutional court", "labour court", "appeal", "sentence", "convicted",
@@ -24,121 +82,148 @@ LEGAL_KEYWORDS = [
     "attorney", "advocate", "lawyer", "prosecution", "accused", "defendant",
     "plaintiff", "applicant", "respondent", "verdict", "ruling", "order",
     "zimra", "revenue authority", "tax", "vat", "customs",
-    "rbn", "reserve bank", "financial intelligence", "aml",
-    "secz", "securities", "stock exchange", "zse",
+    "reserve bank", "financial intelligence", "aml",
+    "securities", "stock exchange", "zse",
     "companies act", "companies registry", "liquidation", "winding up",
     "eviction", "ejectment", "spoliation", "rei vindicatio",
-    "divorce", "matrimonial", "custody", "maintenance",
-    "mining", "mining commissioner", "mining claims",
-    "parliament", "bill", "act", "statutory instrument", "gazette",
-    "constitution", "constitutional", "bill of rights",
-    "criminal", "murder", "theft", "fraud", "corruption",
-    "arrest", "bail", "remand", "plea",
+    "constitution", "constitutional", "bill of rights", "fundamental rights",
+    "parliament", "legislation", "statutory instrument", "gazette",
+    "law society", "legal practitioners", "bar association",
 ]
 
-NEWS_SOURCES = [
-    {
-        "name": "NewsDay",
-        "source_name": "NewsDay Zimbabwe",
-        "url": "https://www.newsday.co.zw/local-news/",
-        "limit": 5,
-    },
-    {
-        "name": "Herald",
-        "source_name": "The Herald Zimbabwe",
-        "url": "https://www.herald.co.zw/category/local/",
-        "limit": 5,
-    },
-    {
-        "name": "Financial Gazette",
-        "source_name": "Financial Gazette Zimbabwe",
-        "url": "https://www.fingaz.co.zw/category/news/",
-        "limit": 4,
-    },
-    {
-        "name": "Zimbabwe Independent",
-        "source_name": "Zimbabwe Independent",
-        "url": "https://www.theindependent.co.zw/category/local/",
-        "limit": 4,
-    },
-    {
-        "name": "Chronicle",
-        "source_name": "The Chronicle Zimbabwe",
-        "url": "https://www.chronicle.co.zw/category/local/",
-        "limit": 3,
-    },
-    {
-        "name": "Business Weekly",
-        "source_name": "Business Weekly Zimbabwe",
-        "url": "https://businessweekly.co.zw/",
-        "limit": 3,
-    },
+RE_DATE  = re.compile(
+    r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
+    r"August|September|October|November|December)\s+\d{4})\b"
+)
+RE_TITLE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+
+# Exclude navigation/utility links
+EXCLUDE_PATTERNS = [
+    "/category/", "/tag/", "/author/", "/page/", "/wp-content/",
+    "/wp-admin/", "/feed/", "#", "mailto:", "tel:", "/about",
+    "/contact", "/advertise", "/subscribe", "/privacy", "/terms",
 ]
 
 
-def _is_legal_article(content: str, title: str = "") -> bool:
-    """Return True if the article contains legal keywords."""
-    text = (title + " " + content[:3000]).lower()
-    matches = sum(1 for kw in LEGAL_KEYWORDS if kw in text)
-    return matches >= 2
+def _is_excluded(url: str) -> bool:
+    return any(pat in url for pat in EXCLUDE_PATTERNS)
 
 
-def _is_valid_content(content: str, url: str) -> bool:
-    if not content or len(content) < 300:
-        return False
-    lower = content[:300].lower()
-    if "404" in lower or "page not found" in lower or "not found" in lower:
-        print(f"[news] skipping 404: {url}")
-        return False
-    return True
+def _is_legal_content(text: str) -> bool:
+    """Return True if the text contains at least one legal keyword."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in LEGAL_KEYWORDS)
 
 
-def scrape_news_source(source: dict) -> int:
-    pushed = 0
+@dataclass
+class NewsItem:
+    url: str
+    title: str
+    source: str                  # e.g. "NewsDay", "The Herald"
+    doc_date: Optional[str]
+    markdown_summary: str
+    pdf_url: Optional[str] = None
+    pdf_path: Optional[Path] = None
+    source_type: str = "news"    # for MutemoOS legal updates
+
+
+async def _scrape_source(source: dict, dry_run: bool = False) -> list[NewsItem]:
+    """Scrape a single news source and return relevant NewsItems."""
     name = source["name"]
+    listing_url = source["listing_url"]
+    article_pattern = source["article_pattern"]
+
+    logger.info(f"[news/{name}] Scraping listing: {listing_url}")
     try:
-        pages = crawl_url(source["url"], limit=source["limit"])
-        for page in pages:
-            url = page.get("metadata", {}).get("sourceURL") or page.get("url", "")
-            if not url or is_seen(url):
-                continue
+        md = await scrape_markdown(listing_url, proxy="basic", wait_ms=1000)
+    except FirecrawlError as e:
+        logger.error(f"[news/{name}] Failed to scrape listing: {e}")
+        return []
 
-            content = page.get("markdown", "") or page.get("content", "")
-            if not _is_valid_content(content, url):
-                continue
+    if not md:
+        logger.warning(f"[news/{name}] Empty markdown from listing")
+        return []
 
-            title = page.get("metadata", {}).get("title", "") or url
+    # Extract article URLs
+    article_urls = article_pattern.findall(md)
+    article_urls = [u for u in article_urls if not _is_excluded(u)]
 
-            # Only push articles relevant to law/courts/regulation
-            if not _is_legal_article(content, title):
-                print(f"[news] skipping non-legal article: {title[:60]}")
-                continue
+    # Deduplicate
+    seen: set[str] = set()
+    unique_urls: list[str] = []
+    for u in article_urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
 
-            push_legal_update(
-                content=f"SOURCE: {source['source_name']}\nURL: {url}\nTITLE: {title}\n\n{content}",
-                filename=f"{name.lower()}_{url.rstrip('/').split('/')[-1][:60]}.txt",
-                source_type="news",
-                source_name=source["source_name"],
-                reference=title[:200],
-            )
+    logger.info(f"[news/{name}] Found {len(unique_urls)} article URLs")
 
-            mark_seen(url)
-            pushed += 1
-            print(f"[news] pushed from {name}: {title[:80]}")
+    items: list[NewsItem] = []
+    max_new = state.get_max_new_per_run()
 
-    except Exception as e:
-        print(f"[news] {name} scrape failed: {e}")
+    for url in unique_urls:
+        if len(items) >= max_new:
+            break
 
-    mark_run(f"news_{name.lower()}")
-    return pushed
+        if state.is_seen(url):
+            state.increment_skipped()
+            continue
+
+        # Scrape the article
+        try:
+            article_md = await scrape_markdown(url, proxy="basic", wait_ms=500)
+        except FirecrawlError as e:
+            logger.warning(f"[news/{name}] Failed to scrape {url}: {e}")
+            continue
+
+        if not article_md or len(article_md) < 100:
+            continue
+
+        # Filter by legal keywords
+        if not _is_legal_content(article_md):
+            logger.debug(f"[news/{name}] Skipping non-legal article: {url}")
+            if not dry_run:
+                state.mark_seen(url)  # mark as seen so we don't check again
+            continue
+
+        title_m = RE_TITLE.search(article_md)
+        title = title_m.group(1).strip() if title_m else url.split("/")[-2].replace("-", " ").title()
+
+        date_m = RE_DATE.search(article_md)
+        doc_date = date_m.group(1).strip() if date_m else None
+
+        summary = article_md[:800].strip()
+
+        item = NewsItem(
+            url=url,
+            title=title,
+            source=name,
+            doc_date=doc_date,
+            markdown_summary=summary,
+        )
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would push news: {title} — {url}")
+        else:
+            state.mark_seen(url)
+
+        items.append(item)
+
+    return items
 
 
-def run():
-    print("[news] starting legal news scrape...")
-    total = 0
+async def run(dry_run: bool = False) -> list[NewsItem]:
+    """
+    Main entry point. Scrapes all news sources and returns new legal NewsItems.
+    Each source is scraped sequentially to avoid rate-limiting.
+    """
+    logger.info(f"[news] Starting scrape (dry_run={dry_run})")
+    all_items: list[NewsItem] = []
+
     for source in NEWS_SOURCES:
-        count = scrape_news_source(source)
-        total += count
-        print(f"[news] {source['name']}: {count} articles pushed")
-    print(f"[news] done — {total} total articles pushed")
-    return total
+        items = await _scrape_source(source, dry_run=dry_run)
+        all_items.extend(items)
+
+    state.set_last_scraped("news")
+    logger.info(f"[news] Done. {len(all_items)} new legal news items.")
+    return all_items

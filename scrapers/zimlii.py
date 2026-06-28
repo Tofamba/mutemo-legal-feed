@@ -1,193 +1,247 @@
 """
-ZimLII scraper — Zimbabwe Legal Information Institute
-Scrapes recent judgments directly by URL pattern.
-Schedule: 04:00 UTC daily (~6am CAT)
+scrapers/zimlii.py — ZimLII judgment scraper.
 
-ZimLII URL pattern for individual judgments:
-  https://zimlii.org/akn/zw/judgment/{court}/{year}/{number}/eng@{date}
+ZimLII (https://zimlii.org) is Cloudflare-protected. We use Firecrawl
+stealth proxy (5 credits/request) to bypass it.
 
-Since we don't know exact dates, we use the listing page to find recent judgment numbers,
-then fetch each judgment individually.
+CORRECT URL STRUCTURE (verified 2026-06-28):
+  Home:      https://zimlii.org/                         → 200 OK (Cloudflare JS challenge)
+  Judgments: https://zimlii.org/judgments/               → 403 (Cloudflare bot challenge, needs stealth)
+  Legislation: https://zimlii.org/legislation/           → 200 OK
+  Individual judgment: https://zimlii.org/akn/zw/judgment/{court}/{year}/{number}/eng@{date}
+  Individual legislation: https://zimlii.org/akn/zw/act/{year}/{number}/eng@{date}
+
+  OLD (broken) URL patterns — DO NOT USE:
+    https://zimlii.org/zw/judgment/...  → 404
+    https://zimlii.org/judgments/       → 403 without stealth
+
+Strategy:
+1. Scrape https://zimlii.org/judgments/ via Firecrawl stealth to get recent judgment links
+2. Parse AKN judgment URLs from the markdown: /akn/zw/judgment/{court}/{year}/{number}/...
+3. For each new URL, scrape the individual judgment page (stealth)
+4. Extract metadata: case_name, citation, court, judge, date, PDF URL
+5. Download the PDF (direct HTTP, no Firecrawl credit needed)
+6. Return JudgmentItem objects for pushing to MutemoOS /api/zlr/upload
+
+Credit budget: ~5 credits/listing + 5 credits/judgment × up to 10 new/day = ~55 credits/day max
 """
+
+import logging
 import re
-from datetime import datetime
-from firecrawl_client import scrape_url, crawl_url
-from state import is_seen, mark_seen, mark_run
-from pusher import push_legal_update, push_zlr_entry
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
-YEAR = datetime.utcnow().year
+from firecrawl_client import scrape_markdown, download_pdf, FirecrawlError
+import state
 
-# Direct listing pages — these exist and return judgment lists
-ZIMLII_HH_LIST   = f"https://zimlii.org/judgments/ZWHHC/{YEAR}/"
-ZIMLII_SC_LIST   = f"https://zimlii.org/judgments/ZWSC/{YEAR}/"
-ZIMLII_CCZ_LIST  = f"https://zimlii.org/judgments/ZWCC/{YEAR}/"
-ZIMLII_LC_LIST   = f"https://zimlii.org/judgments/ZWLC/{YEAR}/"
-ZIMLII_LEGISLATION = "https://zimlii.org/legislation/"
+logger = logging.getLogger(__name__)
 
-COURT_MAP = {
-    "ZWHHC": "zwhhc",
-    "ZWSC":  "zwsc",
-    "ZWCC":  "zwcc",
-    "ZWLC":  "zwlc",
-}
+LISTING_URL = "https://zimlii.org/judgments/"
+BASE_URL    = "https://zimlii.org"
+
+# AKN judgment URL pattern — the correct ZimLII URL structure
+# e.g. /akn/zw/judgment/zwhhc/2026/179/eng@2026-11-20
+RE_AKN_JUDGMENT = re.compile(
+    r"/akn/zw/judgment/[a-z]+/\d{4}/\d+/eng@\d{4}-\d{2}-\d{2}"
+)
+
+# Metadata extraction patterns for judgment page markdown
+RE_CASE_NAME  = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+RE_CITATION   = re.compile(
+    r"\b(ZWSC|ZWCC|ZWHHC|ZWBHC|ZWHHC|ZWMHC|ZWCHC|ZWLC|ZWAC|SC|HH|HC|HB|HG|HMA|HMT)\s*\d+[-/]\d{2,4}\b",
+    re.IGNORECASE,
+)
+RE_COURT      = re.compile(
+    r"(Supreme Court|Constitutional Court|High Court|Labour Court|Administrative Court|"
+    r"Magistrate|Harare High Court|Bulawayo High Court|Chinhoyi High Court|"
+    r"Masvingo High Court|Mutare High Court)",
+    re.IGNORECASE,
+)
+RE_JUDGE      = re.compile(
+    r"(?:JUDGE[S]?|J\b|JA\b|JP\b|DCJ\b|CJ\b)[:\s]+([A-Z][A-Z\s,]+?)(?:\n|$)",
+    re.MULTILINE,
+)
+RE_DATE       = re.compile(
+    r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
+    r"August|September|October|November|December)\s+\d{4})\b"
+)
+RE_PDF_LINK   = re.compile(
+    r"\[.*?(?:PDF|Download|Full judgment).*?\]\((https?://[^\)]+\.pdf[^\)]*)\)",
+    re.IGNORECASE,
+)
+# ZimLII PDF URL pattern: /akn/zw/judgment/{court}/{year}/{number}/eng@{date}/source.pdf
+RE_PDF_PATH   = re.compile(r"/akn/zw/judgment/[^\"'\s]+\.pdf")
 
 
-def _extract_reference(url: str) -> str:
-    parts = url.rstrip("/").split("/")
-    return parts[-1] if parts else url
+@dataclass
+class JudgmentItem:
+    url: str
+    case_name: str
+    citation: Optional[str]
+    court: Optional[str]
+    judge: Optional[str]
+    judgment_date: Optional[str]
+    pdf_url: Optional[str]
+    pdf_path: Optional[Path]
+    source: str = "ZimLII"
+    markdown_summary: str = ""
 
 
-def _is_valid_content(content: str, url: str) -> bool:
-    if not content or len(content) < 300:
-        return False
-    lower = content[:500].lower()
-    if "not found" in lower or "error 404" in lower or "page not found" in lower:
-        print(f"[zimlii] skipping 404: {url}")
-        return False
-    return True
-
-
-def _extract_judgment_urls_from_listing(listing_content: str, court_code: str) -> list:
+async def _get_listing_urls(dry_run: bool = False) -> list[str]:
     """
-    Parse the listing page markdown to find individual judgment URLs.
-    ZimLII listing pages contain links like:
-    /akn/zw/judgment/zwhhc/2026/132/eng@2026-03-25
+    Scrape the ZimLII judgment listing and return all judgment AKN URLs found.
+    Uses Firecrawl stealth proxy to bypass Cloudflare.
     """
-    court_lower = COURT_MAP.get(court_code, court_code.lower())
-    # Match the AKN URL pattern
-    pattern = rf'/akn/zw/judgment/{court_lower}/{YEAR}/(\d+)/eng@(\d{{4}}-\d{{2}}-\d{{2}})'
-    matches = re.findall(pattern, listing_content)
-    urls = []
-    seen_nums = set()
-    for num, date in matches:
-        if num not in seen_nums:
-            seen_nums.add(num)
-            url = f"https://zimlii.org/akn/zw/judgment/{court_lower}/{YEAR}/{num}/eng@{date}"
-            urls.append(url)
-    return urls
-
-
-def scrape_court(court_code: str, list_url: str, limit: int = 5) -> int:
-    """Scrape a court's recent judgments by fetching the listing then individual pages."""
-    pushed = 0
-    court_lower = COURT_MAP.get(court_code, court_code.lower())
-
+    logger.info("[zimlii] Scraping judgment listing via Firecrawl stealth...")
     try:
-        # Step 1: Get the listing page to find recent judgment URLs
-        listing = scrape_url(list_url, formats=["markdown"])
-        listing_content = listing.get("markdown", "") or listing.get("content", "")
+        md = await scrape_markdown(LISTING_URL, proxy="stealth", wait_ms=3000)
+    except FirecrawlError as e:
+        logger.error(f"[zimlii] Failed to scrape listing: {e}")
+        return []
 
-        if not listing_content or len(listing_content) < 100:
-            print(f"[zimlii] listing page returned no content: {list_url}")
-            return 0
+    if not md:
+        logger.error("[zimlii] Empty markdown returned from listing page")
+        return []
 
-        # Step 2: Extract individual judgment URLs
-        judgment_urls = _extract_judgment_urls_from_listing(listing_content, court_code)
+    # Extract AKN judgment paths from markdown links
+    akn_paths = RE_AKN_JUDGMENT.findall(md)
 
-        if not judgment_urls:
-            # Fallback: try constructing URLs for recent judgment numbers
-            print(f"[zimlii] no URLs found in listing, trying number-based fallback for {court_code}")
-            # Find the highest judgment number mentioned in the listing
-            nums = re.findall(r'\b(\d{3,4})\b', listing_content)
-            if nums:
-                latest = max(int(n) for n in nums if int(n) < 2000)
-                for num in range(latest, max(latest - limit, 0), -1):
-                    url = f"https://zimlii.org/judgments/{court_code}/{YEAR}/{num}/"
-                    if not is_seen(url):
-                        judgment_urls.append(url)
+    # Also catch relative links without the date suffix
+    # e.g. /akn/zw/judgment/zwhhc/2026/179 (without /eng@...)
+    relative_paths = re.findall(r"/akn/zw/judgment/[a-z]+/\d{4}/\d+", md)
 
-        print(f"[zimlii] found {len(judgment_urls)} judgment URLs for {court_code}")
+    all_urls = []
+    seen = set()
 
-        # Step 3: Fetch each judgment (up to limit, skip already seen)
-        fetched = 0
-        for url in judgment_urls:
-            if fetched >= limit:
-                break
-            if is_seen(url):
-                continue
+    for path in akn_paths:
+        url = BASE_URL + path
+        if url not in seen:
+            seen.add(url)
+            all_urls.append(url)
 
-            try:
-                result = scrape_url(url, formats=["markdown"])
-                content = result.get("markdown", "") or result.get("content", "")
+    for path in relative_paths:
+        url = BASE_URL + path
+        if url not in seen:
+            seen.add(url)
+            all_urls.append(url)
 
-                if not _is_valid_content(content, url):
-                    continue
-
-                title = result.get("metadata", {}).get("title", "") or f"{court_code} Judgment"
-
-                # These are proper judgment pages — push as ZLR entry
-                is_headnote = bool(re.search(
-                    r'\b(HH|SC|CCZ|LC|HB|HM|HMT)-?\d+[-/]\d+|\[' + str(YEAR) + r'\]\s+ZW',
-                    content
-                ))
-
-                if is_headnote:
-                    push_zlr_entry(
-                        content=content,
-                        filename=f"{court_code}_{_extract_reference(url)}.txt",
-                        source="ZimLII",
-                        zimlii_url=url,
-                    )
-                else:
-                    push_legal_update(
-                        content=content,
-                        filename=f"{court_code}_{_extract_reference(url)}.txt",
-                        source_type="case_law",
-                        source_name="ZimLII",
-                        reference=title[:200],
-                    )
-
-                mark_seen(url)
-                pushed += 1
-                fetched += 1
-                print(f"[zimlii] pushed {court_code}: {title[:80]}")
-
-            except Exception as e:
-                print(f"[zimlii] failed to fetch {url}: {e}")
-                continue
-
-    except Exception as e:
-        print(f"[zimlii] {court_code} scrape failed: {e}")
-
-    mark_run(f"zimlii_{court_code.lower()}")
-    return pushed
+    logger.info(f"[zimlii] Found {len(all_urls)} judgment URLs in listing")
+    return all_urls
 
 
-def scrape_recent_legislation(limit: int = 3) -> int:
-    pushed = 0
+async def _scrape_judgment(url: str, dry_run: bool = False) -> Optional[JudgmentItem]:
+    """Scrape a single ZimLII judgment page and return a JudgmentItem."""
+    logger.info(f"[zimlii] Scraping judgment: {url}")
     try:
-        pages = crawl_url(ZIMLII_LEGISLATION, limit=limit)
-        for page in pages:
-            url = page.get("metadata", {}).get("sourceURL") or page.get("url", "")
-            if not url or is_seen(url):
-                continue
-            content = page.get("markdown", "") or page.get("content", "")
-            if not _is_valid_content(content, url):
-                continue
-            title = page.get("metadata", {}).get("title", "") or _extract_reference(url)
-            push_legal_update(
-                content=content,
-                filename=f"leg_{_extract_reference(url)}.txt",
-                source_type="legislation",
-                source_name="ZimLII",
-                reference=title[:200],
+        md = await scrape_markdown(url, proxy="stealth", wait_ms=2000)
+    except FirecrawlError as e:
+        logger.error(f"[zimlii] Failed to scrape {url}: {e}")
+        return None
+
+    if not md or len(md) < 100:
+        logger.warning(f"[zimlii] Empty or very short markdown for {url}")
+        return None
+
+    # Extract metadata
+    case_name_m = RE_CASE_NAME.search(md)
+    case_name = case_name_m.group(1).strip() if case_name_m else "Unknown v Unknown"
+    # Clean up common artifacts like " | ZimLII" in the title
+    case_name = re.sub(r"\s*\|\s*ZimLII.*$", "", case_name).strip()
+
+    citation_m = RE_CITATION.search(md)
+    citation = citation_m.group(0).strip() if citation_m else None
+
+    court_m = RE_COURT.search(md)
+    court = court_m.group(0).strip() if court_m else "High Court of Zimbabwe"
+
+    judge_m = RE_JUDGE.search(md)
+    judge = judge_m.group(1).strip().rstrip(",") if judge_m else None
+
+    date_m = RE_DATE.search(md)
+    judgment_date = date_m.group(1).strip() if date_m else None
+
+    # Try to find PDF URL — first from explicit markdown links
+    pdf_m = RE_PDF_LINK.search(md)
+    pdf_url = pdf_m.group(1).strip() if pdf_m else None
+
+    # If not found, look for AKN PDF paths in the markdown
+    if not pdf_url:
+        pdf_path_m = RE_PDF_PATH.search(md)
+        if pdf_path_m:
+            pdf_url = BASE_URL + pdf_path_m.group(0)
+
+    # Last resort: construct the standard ZimLII source PDF URL from the AKN path
+    if not pdf_url:
+        # Strip any query string from the URL and append /source.pdf
+        base_akn = url.split("?")[0].rstrip("/")
+        if "/eng@" in base_akn:
+            pdf_url = base_akn + "/source.pdf"
+        else:
+            # Try appending the PDF suffix directly
+            pdf_url = base_akn + ".pdf"
+        logger.debug(f"[zimlii] Constructed PDF URL: {pdf_url}")
+
+    # Take first 800 chars of markdown as summary
+    summary = md[:800].strip()
+
+    item = JudgmentItem(
+        url=url,
+        case_name=case_name,
+        citation=citation,
+        court=court,
+        judge=judge,
+        judgment_date=judgment_date,
+        pdf_url=pdf_url,
+        pdf_path=None,
+        markdown_summary=summary,
+    )
+
+    # Download PDF (skip in dry-run)
+    if not dry_run and pdf_url:
+        try:
+            item.pdf_path = await download_pdf(pdf_url)
+        except Exception as e:
+            logger.warning(f"[zimlii] PDF download failed for {url}: {e}")
+            item.pdf_path = None
+
+    return item
+
+
+async def run(dry_run: bool = False) -> list[JudgmentItem]:
+    """
+    Main entry point. Returns a list of new JudgmentItems not previously seen.
+    Respects MAX_NEW_PER_RUN from state to cap Firecrawl credit usage.
+    """
+    logger.info(f"[zimlii] Starting scrape (dry_run={dry_run})")
+    urls = await _get_listing_urls(dry_run=dry_run)
+
+    new_items: list[JudgmentItem] = []
+    max_new = state.get_max_new_per_run()
+
+    for url in urls:
+        if len(new_items) >= max_new:
+            logger.info(f"[zimlii] Reached MAX_NEW_PER_RUN={max_new}, stopping")
+            break
+
+        if state.is_seen(url):
+            state.increment_skipped()
+            logger.debug(f"[zimlii] Already seen: {url}")
+            continue
+
+        item = await _scrape_judgment(url, dry_run=dry_run)
+        if item is None:
+            continue
+
+        if dry_run:
+            logger.info(
+                f"[DRY RUN] Would push: {item.case_name} ({item.citation}) — {url}"
             )
-            mark_seen(url)
-            pushed += 1
-            print(f"[zimlii] pushed legislation: {title[:80]}")
-    except Exception as e:
-        print(f"[zimlii] legislation scrape failed: {e}")
-    mark_run("zimlii_legislation")
-    return pushed
+        else:
+            state.mark_seen(url)
 
+        new_items.append(item)
 
-def run():
-    print(f"[zimlii] starting scrape for {YEAR}...")
-    hh  = scrape_court("ZWHHC", ZIMLII_HH_LIST,  limit=5)
-    sc  = scrape_court("ZWSC",  ZIMLII_SC_LIST,   limit=3)
-    ccz = scrape_court("ZWCC",  ZIMLII_CCZ_LIST,  limit=2)
-    lc  = scrape_court("ZWLC",  ZIMLII_LC_LIST,   limit=2)
-    leg = scrape_recent_legislation(limit=3)
-    total = hh + sc + ccz + lc + leg
-    print(f"[zimlii] done — HH:{hh} SC:{sc} CCZ:{ccz} LC:{lc} Leg:{leg} Total:{total}")
-    return total
+    state.set_last_scraped("zimlii")
+    logger.info(f"[zimlii] Done. {len(new_items)} new items.")
+    return new_items

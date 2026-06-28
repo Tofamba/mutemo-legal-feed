@@ -1,53 +1,217 @@
 """
-Mutemo Legal Feed — entry point.
-Runs scrapers on a schedule and pushes new legal content to MutemoOS V2.
+main.py — MutemoOS Legal Intelligence Feed Service
+
+A standalone FastAPI service that:
+  1. Scrapes ZimLII, Veritas Zimbabwe, and LRF daily using Firecrawl
+  2. Downloads PDFs for each new judgment/legislation/digest
+  3. Pushes new content to MutemoOS via webhook with retry logic
+  4. Exposes a health endpoint and manual trigger endpoints
+
+Environment variables (all required unless marked optional):
+  FIRECRAWL_API_KEY     — Firecrawl API key (get one at firecrawl.dev)
+  MUTEMOS_BASE_URL      — MutemoOS base URL (e.g. https://mutemoos-production.up.railway.app)
+  MUTEMOS_ADMIN_TOKEN   — MutemoOS admin token (X-Admin-Token header)
+  MUTEMOS_FIRM_ID       — Firm UUID in MutemoOS (optional, for multi-tenant future)
+  FEED_ADMIN_TOKEN      — Token to protect this service's own trigger endpoints
+  DATA_DIR              — Path to persistent volume for state (default: ./data)
+  DRY_RUN               — Set to "true" to scrape without pushing (optional, default: false)
 """
-import os
-import sys
 
-
-# Validate required env vars before starting
-required = ["FIRECRAWL_API_KEY", "MUTEMO_API_URL", "MUTEMO_ADMIN_TOKEN"]
-missing = [k for k in required if not os.environ.get(k)]
-if missing:
-    print(f"[error] Missing required environment variables: {', '.join(missing)}")
-    sys.exit(1)
-
+import asyncio
 import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
+from fastapi.responses import JSONResponse
+
+import state
+import scheduler
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logger = logging.getLogger(__name__)
 
-from scheduler import build_scheduler
+# ── Config ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    # Allow running a single scraper manually:
-    # python main.py zimlii
-    # python main.py veritas
-    # python main.py lrf
-    if len(sys.argv) > 1:
-        target = sys.argv[1].lower()
-        if target == "zimlii":
-            from scrapers.zimlii import run
-        elif target == "veritas":
-            from scrapers.veritas import run
-        elif target == "lrf":
-            from scrapers.lrf import run
-        else:
-            print(f"Unknown scraper: {target}. Use: zimlii, veritas, lrf")
-            sys.exit(1)
-        print(f"[manual] Running {target} scraper now...")
-        pushed = run()
-        print(f"[manual] Done — {pushed} items pushed")
-        sys.exit(0)
+FEED_ADMIN_TOKEN = os.environ.get("FEED_ADMIN_TOKEN", "")
+DRY_RUN          = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-    # Normal mode — run scheduler
-    print("[feed] Starting Mutemo Legal Feed scheduler...")
-    print("[feed] Schedule: ZimLII 04:00 UTC · Veritas 04:30 UTC · LRF 05:00 UTC")
-    scheduler = build_scheduler()
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        print("[feed] Scheduler stopped.")
+if DRY_RUN:
+    logger.warning("⚠️  DRY_RUN mode enabled — no content will be pushed to MutemoOS")
+
+
+# ── Auth helper ───────────────────────────────────────────────────────────────
+
+def _require_admin(x_feed_admin_token: str = Header(default="")) -> None:
+    if not FEED_ADMIN_TOKEN:
+        # No token configured — allow all (useful for local dev)
+        return
+    if x_feed_admin_token != FEED_ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Feed-Admin-Token header")
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+_scheduler_task: asyncio.Task | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _scheduler_task
+    logger.info("🚀 Legal Intelligence Feed starting up...")
+    logger.info(f"   DRY_RUN: {DRY_RUN}")
+    logger.info(f"   MutemoOS: {os.environ.get('MUTEMOS_BASE_URL', 'not set')}")
+    logger.info(f"   Data dir: {os.environ.get('DATA_DIR', './data')}")
+
+    # Start the background scheduler
+    _scheduler_task = asyncio.create_task(
+        scheduler.scheduler_loop(dry_run=DRY_RUN),
+        name="legal_feed_scheduler",
+    )
+    logger.info("📅 Scheduler started (ZimLII 06:00 CAT | Veritas 06:30 CAT | LRF 07:00 CAT)")
+
+    yield
+
+    # Shutdown
+    if _scheduler_task and not _scheduler_task.done():
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Legal Intelligence Feed shut down cleanly.")
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="MutemoOS Legal Intelligence Feed",
+    description=(
+        "Automated legal content scraper for Zimbabwe law firms. "
+        "Monitors ZimLII, Veritas Zimbabwe, and LRF for new judgments, "
+        "legislation, and case digests, then pushes them to MutemoOS."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    """Health check endpoint. Returns service status and scrape stats."""
+    stats = state.get_stats()
+    scheduler_running = (
+        _scheduler_task is not None
+        and not _scheduler_task.done()
+    )
+    return {
+        "status": "ok",
+        "dry_run": DRY_RUN,
+        "scheduler_running": scheduler_running,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **stats,
+    }
+
+
+@app.get("/")
+async def root():
+    return {"service": "MutemoOS Legal Intelligence Feed", "status": "running", "docs": "/docs"}
+
+
+# ── Manual trigger endpoints ──────────────────────────────────────────────────
+
+@app.post("/trigger/all")
+async def trigger_all(
+    background_tasks: BackgroundTasks,
+    dry_run: bool = Query(default=None, description="Override DRY_RUN env var for this run"),
+    x_feed_admin_token: str = Header(default=""),
+):
+    """
+    Manually trigger all three scrapers.
+    Runs in the background — returns immediately with a job ID.
+    Protected by X-Feed-Admin-Token header.
+    """
+    _require_admin(x_feed_admin_token)
+    effective_dry_run = dry_run if dry_run is not None else DRY_RUN
+
+    async def _run():
+        logger.info(f"[trigger] Manual run_all triggered (dry_run={effective_dry_run})")
+        results = await scheduler.run_all(dry_run=effective_dry_run)
+        logger.info(f"[trigger] Manual run_all complete: {results}")
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "triggered",
+        "sources": ["zimlii", "veritas", "lrf", "news"],
+        "dry_run": effective_dry_run,
+        "message": "All scrapers running in background. Check /health for stats.",
+    }
+
+
+@app.post("/trigger/{source}")
+async def trigger_source(
+    source: str,
+    background_tasks: BackgroundTasks,
+    dry_run: bool = Query(default=None, description="Override DRY_RUN env var for this run"),
+    x_feed_admin_token: str = Header(default=""),
+):
+    """
+    Manually trigger a single scraper by name.
+    Valid sources: zimlii, veritas, lrf
+    Protected by X-Feed-Admin-Token header.
+    """
+    _require_admin(x_feed_admin_token)
+    valid_sources = ["zimlii", "veritas", "lrf", "news"]
+    if source not in valid_sources:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown source '{source}'. Valid: {valid_sources}"
+        )
+
+    effective_dry_run = dry_run if dry_run is not None else DRY_RUN
+
+    async def _run():
+        logger.info(f"[trigger] Manual {source} triggered (dry_run={effective_dry_run})")
+        result = await scheduler.run_single(source, dry_run=effective_dry_run)
+        logger.info(f"[trigger] Manual {source} complete: {result}")
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "triggered",
+        "source": source,
+        "dry_run": effective_dry_run,
+        "message": f"{source} scraper running in background. Check /health for stats.",
+    }
+
+
+# ── Audit endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/failures")
+async def get_failures(x_feed_admin_token: str = Header(default="")):
+    """Return the list of push failures for audit."""
+    _require_admin(x_feed_admin_token)
+    return {"failures": state.get_failures()}
+
+
+@app.delete("/failures")
+async def clear_failures(x_feed_admin_token: str = Header(default="")):
+    """Clear the push failure log after manual review."""
+    _require_admin(x_feed_admin_token)
+    state.clear_failures()
+    return {"status": "cleared"}
+
+
+@app.get("/stats")
+async def get_stats(x_feed_admin_token: str = Header(default="")):
+    """Return detailed stats and last-scraped timestamps."""
+    _require_admin(x_feed_admin_token)
+    return state.get_stats()

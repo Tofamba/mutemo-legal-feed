@@ -83,20 +83,20 @@ NEWS_SOURCES = [
     },
 ]
 
+# Tightened legal keywords — generic terms removed to reduce noise
+# Article must match at least 2 keywords to be included
 LEGAL_KEYWORDS = [
     "court", "judge", "judgment", "magistrate", "high court", "supreme court",
     "constitutional court", "labour court", "appeal", "sentence", "convicted",
-    "acquitted", "interdict", "injunction", "lawsuit", "litigation", "legal",
+    "acquitted", "interdict", "injunction", "lawsuit", "litigation",
     "attorney", "advocate", "lawyer", "prosecution", "accused", "defendant",
-    "plaintiff", "applicant", "respondent", "verdict", "ruling", "order",
-    "zimra", "revenue authority", "tax", "vat", "customs",
+    "plaintiff", "applicant", "respondent", "verdict",
+    "zimra", "revenue authority",
     "reserve bank", "financial intelligence", "aml",
-    "securities", "stock exchange", "zse",
     "companies act", "companies registry", "liquidation", "winding up",
     "eviction", "ejectment", "spoliation", "rei vindicatio",
-    "constitution", "constitutional", "bill of rights", "fundamental rights",
-    "parliament", "legislation", "statutory instrument", "gazette",
-    "law society", "legal practitioners", "bar association",
+    "bill of rights", "fundamental rights",
+    "statutory instrument", "law society", "legal practitioners",
 ]
 
 RE_DATE  = re.compile(
@@ -118,8 +118,10 @@ def _is_excluded(url: str) -> bool:
 
 
 def _is_legal_content(text: str) -> bool:
+    """Return True if the text contains at least 2 legal keywords."""
     text_lower = text.lower()
-    return any(kw in text_lower for kw in LEGAL_KEYWORDS)
+    matches = sum(1 for kw in LEGAL_KEYWORDS if kw in text_lower)
+    return matches >= 2
 
 
 @dataclass

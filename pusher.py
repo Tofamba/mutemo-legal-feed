@@ -2,9 +2,9 @@
 pusher.py — Push new legal content to MutemoOS via webhook.
 
 Pushes:
-  - ZimLII judgments → POST /api/zlr/upload  (multipart with PDF)
-  - Veritas legislation → POST /api/legal-updates/upload  (multipart with PDF)
-  - LRF digests → POST /api/zlr/upload  (multipart with PDF, source=LRF)
+  - ZimLII judgments → POST /api/zlr/upload  (multipart with PDF or text)
+  - Veritas legislation → POST /api/legal-updates/upload  (multipart with PDF or text)
+  - LRF digests → POST /api/zlr/upload  (multipart with PDF or text, source=LRF)
 
 Retry policy:
   - 3 attempts with exponential backoff: 5s, 15s, 45s
@@ -15,7 +15,7 @@ Authentication:
   MutemoOS v2 uses OTP-based sessions. For the feed service we use the
   MUTEMOS_ADMIN_TOKEN header (X-Admin-Token) which bypasses OTP for
   machine-to-machine calls. Set MUTEMOS_ADMIN_TOKEN in env vars.
-  
+
   Cloudflare Access is bypassed using a service token (CF_CLIENT_ID and
   CF_CLIENT_SECRET) sent as CF-Access-Client-Id and CF-Access-Client-Secret
   headers on every request.
@@ -62,34 +62,61 @@ def _build_headers() -> dict:
     return headers
 
 
+def _make_text_file(item: Union[JudgmentItem, DigestItem]) -> tuple:
+    """Build a text file tuple from judgment metadata when no PDF is available."""
+    content = "\n".join([
+        f"URL: {item.url}",
+        f"CASE: {item.case_name or ''}",
+        f"CITATION: {item.citation or ''}",
+        f"COURT: {getattr(item, 'court', '') or ''}",
+        f"JUDGE: {getattr(item, 'judge', '') or ''}",
+        f"DATE: {getattr(item, 'judgment_date', '') or getattr(item, 'doc_date', '') or ''}",
+        f"SOURCE: {item.source}",
+        "",
+        item.markdown_summary or "",
+    ])
+    filename = f"{(item.case_name or 'judgment').replace(' ', '_')[:60]}.txt"
+    return (filename, content.encode("utf-8"), "text/plain")
+
+
+def _make_legal_text_file(item: LegislationItem) -> tuple:
+    """Build a text file tuple from legislation metadata when no PDF is available."""
+    content = "\n".join([
+        f"URL: {item.url}",
+        f"TITLE: {item.title}",
+        f"REFERENCE: {item.reference or ''}",
+        f"DATE: {item.doc_date or ''}",
+        f"SOURCE: {item.source}",
+        f"TYPE: {item.source_type}",
+        "",
+        item.markdown_summary or "",
+    ])
+    filename = f"{item.title.replace(' ', '_')[:60]}.txt"
+    return (filename, content.encode("utf-8"), "text/plain")
+
+
 async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem], client: httpx.AsyncClient) -> bool:
     """Push a judgment or LRF digest to /api/zlr/upload."""
     url = f"{MUTEMOS_BASE_URL}/api/zlr/upload"
 
     form_data = {
         "source": item.source,
-        "case_name": item.case_name or item.title if hasattr(item, "title") else (item.case_name or "Unknown"),
-        "citation": item.citation or "",
-        "court": getattr(item, "court", "") or "",
-        "judge": getattr(item, "judge", "") or "",
-        "judgment_date": item.judgment_date if hasattr(item, "judgment_date") else (getattr(item, "doc_date", "") or ""),
         "zimlii_url": item.url,
-        "summary": item.markdown_summary[:500] if item.markdown_summary else "",
     }
 
-    files = None
     pdf_path: Optional[Path] = item.pdf_path
-
-    if pdf_path and pdf_path.exists():
-        files = {"file": (pdf_path.name, open(pdf_path, "rb"), "application/pdf")}
-    else:
-        logger.warning(f"[pusher] No PDF for {item.url} — pushing metadata only")
+    opened_file = None
 
     try:
-        if files:
-            resp = await client.post(url, data=form_data, files=files, headers=_build_headers())
+        if pdf_path and pdf_path.exists():
+            opened_file = open(pdf_path, "rb")
+            files = {"file": (pdf_path.name, opened_file, "application/pdf")}
+            logger.info(f"[pusher] Pushing PDF for {item.url}")
         else:
-            resp = await client.post(url, data=form_data, headers=_build_headers())
+            logger.warning(f"[pusher] No PDF for {item.url} — pushing markdown as text file")
+            files = {"file": _make_text_file(item)}
+
+        resp = await client.post(url, data=form_data, files=files, headers=_build_headers())
 
         if resp.status_code in (200, 201, 202):
             logger.info(f"[pusher] ✓ ZLR pushed: {item.url}")
@@ -98,9 +125,10 @@ async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem], client: httpx.A
         else:
             logger.warning(f"[pusher] ZLR push failed {resp.status_code}: {resp.text[:200]}")
             return False
+
     finally:
-        if files:
-            files["file"][1].close()
+        if opened_file:
+            opened_file.close()
         if pdf_path and pdf_path.exists():
             try:
                 pdf_path.unlink()
@@ -115,26 +143,22 @@ async def _push_legal_update(item: LegislationItem, client: httpx.AsyncClient) -
     form_data = {
         "source_type": item.source_type,
         "source_name": item.source,
-        "reference": item.reference or "",
-        "doc_date": item.doc_date or "",
-        "title": item.title,
-        "summary": item.markdown_summary[:500] if item.markdown_summary else "",
-        "source_url": item.url,
+        "reference": item.reference or item.title[:200],
     }
 
-    files = None
     pdf_path: Optional[Path] = item.pdf_path
-
-    if pdf_path and pdf_path.exists():
-        files = {"file": (pdf_path.name, open(pdf_path, "rb"), "application/pdf")}
-    else:
-        logger.warning(f"[pusher] No PDF for {item.url} — pushing metadata only")
+    opened_file = None
 
     try:
-        if files:
-            resp = await client.post(url, data=form_data, files=files, headers=_build_headers())
+        if pdf_path and pdf_path.exists():
+            opened_file = open(pdf_path, "rb")
+            files = {"file": (pdf_path.name, opened_file, "application/pdf")}
+            logger.info(f"[pusher] Pushing PDF for {item.url}")
         else:
-            resp = await client.post(url, data=form_data, headers=_build_headers())
+            logger.warning(f"[pusher] No PDF for {item.url} — pushing markdown as text file")
+            files = {"file": _make_legal_text_file(item)}
+
+        resp = await client.post(url, data=form_data, files=files, headers=_build_headers())
 
         if resp.status_code in (200, 201, 202):
             logger.info(f"[pusher] ✓ Legal update pushed: {item.url}")
@@ -143,9 +167,10 @@ async def _push_legal_update(item: LegislationItem, client: httpx.AsyncClient) -
         else:
             logger.warning(f"[pusher] Legal update push failed {resp.status_code}: {resp.text[:200]}")
             return False
+
     finally:
-        if files:
-            files["file"][1].close()
+        if opened_file:
+            opened_file.close()
         if pdf_path and pdf_path.exists():
             try:
                 pdf_path.unlink()

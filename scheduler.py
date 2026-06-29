@@ -2,45 +2,40 @@
 scheduler.py — Daily scrape scheduler for the Legal Intelligence Feed.
 
 Schedule (all times UTC, which is CAT - 2h):
-  04:00 UTC (06:00 CAT) — ZimLII judgments
-  04:30 UTC (06:30 CAT) — Veritas Zimbabwe legislation
-  05:00 UTC (07:00 CAT) — LRF case digests
+  WEEKDAYS (Mon-Fri):
+    04:00 UTC (06:00 CAT) — ZimLII judgments
+    04:30 UTC (06:30 CAT) — Veritas Zimbabwe legislation
+    05:00 UTC (07:00 CAT) — LRF case digests (Mondays only)
+    05:30 UTC (07:30 CAT) — Legal news (6 sources)
+    06:00 UTC (08:00 CAT) — ZLHR press statements
 
-Runs as a background asyncio task inside the FastAPI app.
-Uses a simple loop with asyncio.sleep — no external task queue needed.
-
-Credit budget (Firecrawl free tier: 500/month):
-  ZimLII:  ~2 pages × 5 credits (stealth) × 30 days = 300 credits
-  Veritas: ~2 pages × 5 credits (stealth) × 30 days = 300 credits
-  LRF:     ~2 pages × 1 credit  (basic)   × 30 days =  60 credits
-  Individual judgment pages: ~2/day × 5 credits × 30 days = 300 credits
-  ──────────────────────────────────────────────────────────────────
-  Estimated total: ~460 credits/month (within 500 free tier)
-
-  Note: If ZimLII publishes many new judgments in a single day, the
-  per-judgment scrapes could push over the limit. The scraper caps at
-  MAX_NEW_PER_RUN new items per run to stay within budget.
+  WEEKLY (Sundays):
+    06:00 UTC (08:00 CAT) — Laws.Africa Knowledge Base API
+    06:30 UTC (08:30 CAT) — Zimbabwe Electronic Law Journal
 """
 
 import asyncio
+import calendar
 import logging
 from datetime import datetime, timezone, time as dtime
 
 import state
 import pusher
-from scrapers import zimlii, veritas, lrf, news
+from scrapers import zimlii, veritas, lrf, news, zlhr, lawsafrica
 
 logger = logging.getLogger(__name__)
 
-# Maximum new items to process per scraper run (credit budget guard)
 MAX_NEW_PER_RUN = 10
 
-# Schedule: (hour_utc, minute_utc, scraper_name)
+# (hour_utc, minute_utc, scraper_name, run_weekdays, run_weekends, mondays_only)
 SCHEDULE = [
-    (4,  0,  "zimlii"),
-    (4, 30,  "veritas"),
-    (5,  0,  "lrf"),
-    (5, 30,  "news"),
+    (4,  0,  "zimlii",     True,  False, False),
+    (4, 30,  "veritas",    True,  False, False),
+    (5,  0,  "lrf",        True,  False, True),
+    (5, 30,  "news",       True,  False, False),
+    (6,  0,  "zlhr",       True,  False, False),
+    (6,  0,  "lawsafrica", False, True,  False),
+    (6, 30,  "zelj",       False, True,  False),
 ]
 
 
@@ -53,7 +48,7 @@ async def _run_zimlii(dry_run: bool = False) -> dict:
         logger.info(f"[scheduler] ZimLII complete: {result}")
         return result
     except Exception as e:
-        logger.error(f"[scheduler] ZimLII scrape failed: {e}", exc_info=True)
+        logger.error(f"[scheduler] ZimLII failed: {e}", exc_info=True)
         return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
 
 
@@ -66,20 +61,7 @@ async def _run_veritas(dry_run: bool = False) -> dict:
         logger.info(f"[scheduler] Veritas complete: {result}")
         return result
     except Exception as e:
-        logger.error(f"[scheduler] Veritas scrape failed: {e}", exc_info=True)
-        return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
-
-
-async def _run_news(dry_run: bool = False) -> dict:
-    logger.info("[scheduler] Running legal news scrape...")
-    try:
-        items = await news.run(dry_run=dry_run)
-        items = items[:MAX_NEW_PER_RUN]
-        result = await pusher.push_batch(items, dry_run=dry_run)
-        logger.info(f"[scheduler] News complete: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"[scheduler] News scrape failed: {e}", exc_info=True)
+        logger.error(f"[scheduler] Veritas failed: {e}", exc_info=True)
         return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
 
 
@@ -92,20 +74,66 @@ async def _run_lrf(dry_run: bool = False) -> dict:
         logger.info(f"[scheduler] LRF complete: {result}")
         return result
     except Exception as e:
-        logger.error(f"[scheduler] LRF scrape failed: {e}", exc_info=True)
+        logger.error(f"[scheduler] LRF failed: {e}", exc_info=True)
         return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
 
 
+async def _run_news(dry_run: bool = False) -> dict:
+    logger.info("[scheduler] Running news scrape...")
+    try:
+        items = await news.run(dry_run=dry_run)
+        items = items[:MAX_NEW_PER_RUN]
+        result = await pusher.push_batch(items, dry_run=dry_run)
+        logger.info(f"[scheduler] News complete: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[scheduler] News failed: {e}", exc_info=True)
+        return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
+
+
+async def _run_zlhr(dry_run: bool = False) -> dict:
+    logger.info("[scheduler] Running ZLHR scrape...")
+    try:
+        items = await zlhr.run(dry_run=dry_run)
+        items = items[:MAX_NEW_PER_RUN]
+        result = await pusher.push_batch(items, dry_run=dry_run)
+        logger.info(f"[scheduler] ZLHR complete: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[scheduler] ZLHR failed: {e}", exc_info=True)
+        return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
+
+
+async def _run_lawsafrica(dry_run: bool = False) -> dict:
+    logger.info("[scheduler] Running Laws.Africa scrape...")
+    try:
+        items = await lawsafrica.run(dry_run=dry_run)
+        items = items[:MAX_NEW_PER_RUN]
+        result = await pusher.push_batch(items, dry_run=dry_run)
+        logger.info(f"[scheduler] Laws.Africa complete: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[scheduler] Laws.Africa failed: {e}", exc_info=True)
+        return {"pushed": 0, "failed": 0, "total": 0, "error": str(e)}
+
+
+async def _run_zelj(dry_run: bool = False) -> dict:
+    logger.info("[scheduler] ZELJ scraper not yet implemented — skipping")
+    return {"pushed": 0, "failed": 0, "total": 0, "skipped": True}
+
+
 SCRAPER_MAP = {
-    "zimlii":  _run_zimlii,
-    "veritas": _run_veritas,
-    "lrf":     _run_lrf,
-    "news":    _run_news,
+    "zimlii":     _run_zimlii,
+    "veritas":    _run_veritas,
+    "lrf":        _run_lrf,
+    "news":       _run_news,
+    "zlhr":       _run_zlhr,
+    "lawsafrica": _run_lawsafrica,
+    "zelj":       _run_zelj,
 }
 
 
 async def run_all(dry_run: bool = False) -> dict:
-    """Run all three scrapers sequentially. Used by the manual trigger endpoint."""
     logger.info(f"[scheduler] Running all scrapers (dry_run={dry_run})")
     results = {}
     for name, fn in SCRAPER_MAP.items():
@@ -114,53 +142,50 @@ async def run_all(dry_run: bool = False) -> dict:
 
 
 async def run_single(source: str, dry_run: bool = False) -> dict:
-    """Run a single scraper by name. Used by the manual trigger endpoint."""
     if source not in SCRAPER_MAP:
         raise ValueError(f"Unknown source: {source}. Valid: {list(SCRAPER_MAP.keys())}")
     return await SCRAPER_MAP[source](dry_run=dry_run)
 
 
-def _seconds_until(hour: int, minute: int) -> float:
-    """Return seconds until the next occurrence of HH:MM UTC."""
-    now = datetime.now(timezone.utc)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        # Already past today — schedule for tomorrow
-        from datetime import timedelta
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
+def _should_run(hour: int, minute: int, name: str,
+                run_weekdays: bool, run_weekends: bool, mondays_only: bool,
+                now: datetime) -> bool:
+    current_time = now.time().replace(second=0, microsecond=0)
+    weekday = now.weekday()
+    is_weekday = weekday < 5
+    is_weekend = weekday >= 5
+    is_monday = weekday == calendar.MONDAY
+
+    if current_time.hour != hour or current_time.minute != minute:
+        return False
+    if mondays_only and not is_monday:
+        return False
+    if run_weekdays and not run_weekends and is_weekend:
+        return False
+    if run_weekends and not run_weekdays and is_weekday:
+        return False
+    return True
 
 
 async def scheduler_loop(dry_run: bool = False) -> None:
-    """
-    Background task that runs the scrapers on schedule.
-    Designed to run forever inside the FastAPI lifespan.
-    """
     logger.info(f"[scheduler] Scheduler started (dry_run={dry_run})")
-    logger.info(f"[scheduler] Schedule: ZimLII 04:00 UTC | Veritas 04:30 UTC | LRF 05:00 UTC | News 05:30 UTC")
+    logger.info("[scheduler] Mon-Fri: ZimLII 04:00 | Veritas 04:30 | News 05:30 | ZLHR 06:00 UTC")
+    logger.info("[scheduler] Mondays: LRF 05:00 UTC")
+    logger.info("[scheduler] Sundays: Laws.Africa 06:00 | ZELJ 06:30 UTC")
 
-    # Track which jobs have been scheduled
     pending: dict[str, asyncio.Task] = {}
 
     while True:
         now = datetime.now(timezone.utc)
 
-        for hour, minute, name in SCHEDULE:
-            # Check if it's time to run this scraper
-            target_time = dtime(hour, minute)
-            current_time = now.time().replace(second=0, microsecond=0)
-
-            # Run if within the current minute and not already running
-            if (
-                current_time.hour == target_time.hour
-                and current_time.minute == target_time.minute
-                and name not in pending
-            ):
-                logger.info(f"[scheduler] Triggering {name} at {now.strftime('%H:%M UTC')}")
+        for hour, minute, name, run_weekdays, run_weekends, mondays_only in SCHEDULE:
+            if name in pending:
+                continue
+            if _should_run(hour, minute, name, run_weekdays, run_weekends, mondays_only, now):
+                logger.info(f"[scheduler] Triggering {name} at {now.strftime('%H:%M UTC')} (weekday={now.weekday()})")
                 task = asyncio.create_task(SCRAPER_MAP[name](dry_run=dry_run))
                 pending[name] = task
 
-        # Clean up completed tasks
         done = [name for name, task in pending.items() if task.done()]
         for name in done:
             task = pending.pop(name)
@@ -170,5 +195,4 @@ async def scheduler_loop(dry_run: bool = False) -> None:
             except Exception as e:
                 logger.error(f"[scheduler] {name} task raised: {e}")
 
-        # Sleep 55 seconds between checks (avoids double-triggering within same minute)
         await asyncio.sleep(55)

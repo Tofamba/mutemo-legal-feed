@@ -26,16 +26,18 @@ logger = logging.getLogger(__name__)
 LISTING_URL = "https://www.zlhr.org.zw/"
 BASE_URL    = "https://www.zlhr.org.zw"
 
-# ZLHR article URLs — simple slug after domain
+# Only match article slugs with at least 10 chars — filters out short nav pages
+# e.g. /vision/, /work/, /mission/ won't match but
+# /high-court-ends-students-month-long-detention/ will
 RE_ARTICLE_URL = re.compile(
-    r"https://www\.zlhr\.org\.zw/[a-z0-9][a-z0-9\-]+/?"
+    r"https://www\.zlhr\.org\.zw/[a-z0-9][a-z0-9\-]{10,}/?"
 )
 
 RE_DATE  = re.compile(
     r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
     r"August|September|October|November|December)\s+\d{4})\b"
 )
-RE_TITLE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+RE_TITLE    = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 RE_CITATION = re.compile(
     r"\b(ZWSC|ZWCC|ZWHHC|ZWBHC|ZWLC|SC|HH|HC|HB)\s*\d+[-/]\d{2,4}\b",
     re.IGNORECASE,
@@ -45,11 +47,18 @@ RE_CASE_NAME = re.compile(
 )
 
 EXCLUDE_PATTERNS = [
-    "/wp-content/", "/wp-admin/", "/wp-json/", "/feed/", "#",
-    "mailto:", "tel:", "/about", "/contact", "/donate", "/programmes/",
+    "/wp-content/", "/wp-admin/", "/wp-json/", "/feed/",
+    "#", "mailto:", "tel:",
+    "/vision/", "/mission/", "/work/", "/access-to-justice/",
+    "/publications/", "/resources/", "/news/", "/events/",
+    "/programmes/", "/projects/", "/support-us/", "/get-involved/",
     "/manicaland/", "/matabeleland/", "/masvingo/", "/midlands/",
     "/mashonaland/", "/bulawayo/", "/harare/", "/membership/",
     "/board/", "/staff/", "/category/", "/tag/", "/page/",
+    "/about/", "/contact/", "/donate/", "/privacy/", "/terms/",
+    "/strategic-litigation/", "/constitutional-litigation/",
+    "/anti-impunity/", "/mobile-legal-clinics/",
+    "/human-rights-defenders/", "/public-education/",
 ]
 
 
@@ -67,6 +76,7 @@ class ZLHRItem:
     pdf_url: Optional[str] = None
     pdf_path: Optional[Path] = None
     source: str = "ZLHR"
+    source_type: str = "news"
     markdown_summary: str = ""
 
 
@@ -110,6 +120,8 @@ async def _scrape_article(url: str) -> Optional[ZLHRItem]:
 
     title_m = RE_TITLE.search(md)
     title = title_m.group(1).strip() if title_m else url.rstrip("/").split("/")[-1].replace("-", " ").title()
+    # Clean ZimLII-style suffix
+    title = re.sub(r"\s*\|\s*ZLHR.*$", "", title).strip()
 
     citation_m = RE_CITATION.search(md)
     citation = citation_m.group(0).strip() if citation_m else None

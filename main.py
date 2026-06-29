@@ -122,6 +122,41 @@ async def health():
     }
 
 
+@app.get("/health/alerts")
+async def health_alerts():
+    """AlertEngine-compatible health endpoint."""
+    import time
+    stats = state.get_stats()
+
+    scheduler_running = (
+        _scheduler_task is not None
+        and not _scheduler_task.done()
+    )
+
+    total = stats.get("total_pushed", 0) + stats.get("total_failed", 0)
+    error_rate = (stats.get("total_failed", 0) / total) if total > 0 else 0.0
+
+    if not scheduler_running:
+        score = 0.0
+    elif error_rate > 0.5:
+        score = 20.0
+    elif error_rate > 0.2:
+        score = 60.0
+    elif error_rate > 0.1:
+        score = 80.0
+    else:
+        score = 100.0
+
+    return {
+        "status": "ok" if scheduler_running else "critical",
+        "score": score,
+        "p95_latency": 0.0,
+        "error_rate": round(error_rate, 4),
+        "timestamp": time.time(),
+        "scheduler_running": scheduler_running,
+    }
+
+
 @app.get("/")
 async def root():
     return {"service": "MutemoOS Legal Intelligence Feed", "status": "running", "docs": "/docs"}

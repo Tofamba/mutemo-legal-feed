@@ -201,7 +201,7 @@ async def trigger_source(
 ):
     """
     Manually trigger a single scraper by name.
-    Valid sources: zimlii, veritas, lrf
+    valid_sources = ["zimlii", "veritas", "lrf", "news", "zlhr", "lawsafrica", "zelj"]
     Protected by X-Feed-Admin-Token header.
     """
     _require_admin(x_feed_admin_token)

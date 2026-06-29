@@ -5,8 +5,11 @@ ZLHR (https://zlhr.org.zw) publishes press statements and case updates
 on human rights litigation in Zimbabwe. Simple WordPress site, no
 Cloudflare protection.
 
-URL structure: https://www.zlhr.org.zw/article-slug/
-Listing page: https://www.zlhr.org.zw/ (homepage shows recent posts)
+Strategy:
+1. Scrape the ZLHR lead story category page for recent case updates
+2. Filter URLs by legal keywords in the slug
+3. Scrape each article and extract metadata
+4. Push to MutemoOS as legal updates
 
 Schedule: weekdays at 06:00 UTC (08:00 CAT)
 Credit budget: 1 credit/listing + 1 credit/article × up to 10 = ~11 credits/run
@@ -23,15 +26,26 @@ import state
 
 logger = logging.getLogger(__name__)
 
-LISTING_URL = "https://www.zlhr.org.zw/"
+LISTING_URL = "https://www.zlhr.org.zw/category/lead-story/"
 BASE_URL    = "https://www.zlhr.org.zw"
 
-# Only match article slugs with at least 10 chars — filters out short nav pages
-# e.g. /vision/, /work/, /mission/ won't match but
-# /high-court-ends-students-month-long-detention/ will
+# Match ZLHR article URLs — slugs with at least 10 chars
 RE_ARTICLE_URL = re.compile(
     r"https://www\.zlhr\.org\.zw/[a-z0-9][a-z0-9\-]{10,}/?"
 )
+
+# Keywords that indicate a real case/court article slug
+ARTICLE_KEYWORDS = [
+    "court", "high-court", "acquit", "freed", "detained", "arrested",
+    "sentence", "judge", "bail", "conviction", "quash", "appeal",
+    "magistrate", "supreme", "constitutional", "prosecutor", "charge",
+    "detention", "prison", "release", "ruling", "judgment",
+    "zlhr-welcomes", "zlhr-condemns", "zlhr-calls", "zlhr-urges",
+    "zlhr-demands", "human-rights", "lawyers-for", "rights-defenders",
+    "lawyer-arrested", "advocate", "trial", "remand", "acquittal",
+    "interdict", "injunction", "hearing", "verdict", "murder",
+    "torture", "police", "zrp", "zanu", "opposition",
+]
 
 RE_DATE  = re.compile(
     r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
@@ -59,11 +73,20 @@ EXCLUDE_PATTERNS = [
     "/strategic-litigation/", "/constitutional-litigation/",
     "/anti-impunity/", "/mobile-legal-clinics/",
     "/human-rights-defenders/", "/public-education/",
+    "/special-projects/", "/annual-reports/", "/policy-briefs/",
+    "/fact-sheets/", "/external-links/", "/documentaries/",
+    "/head-office/", "/event-", "/zlhr-hosts-media",
 ]
 
 
 def _is_excluded(url: str) -> bool:
     return any(pat in url for pat in EXCLUDE_PATTERNS)
+
+
+def _is_article(url: str) -> bool:
+    """Return True if the URL slug looks like a case/court article."""
+    slug = url.rstrip("/").split("/")[-1].lower()
+    return any(kw in slug for kw in ARTICLE_KEYWORDS)
 
 
 @dataclass
@@ -96,7 +119,7 @@ async def _get_listing_urls() -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for url in found:
-        if url not in seen and not _is_excluded(url):
+        if url not in seen and not _is_excluded(url) and _is_article(url):
             seen.add(url)
             unique.append(url)
 
@@ -119,8 +142,8 @@ async def _scrape_article(url: str) -> Optional[ZLHRItem]:
         return None
 
     title_m = RE_TITLE.search(md)
-    title = title_m.group(1).strip() if title_m else url.rstrip("/").split("/")[-1].replace("-", " ").title()
-    # Clean ZimLII-style suffix
+    title = title_m.group(1).strip() if title_m else \
+        url.rstrip("/").split("/")[-1].replace("-", " ").title()
     title = re.sub(r"\s*\|\s*ZLHR.*$", "", title).strip()
 
     citation_m = RE_CITATION.search(md)

@@ -9,19 +9,12 @@ CORRECT URL STRUCTURE (verified 2026-06-28):
     /case-law/                     → 404
     /category/publications/        → 404
 
-  The WordPress REST API is available at /wp-json/wp/v2/
-  but returns empty arrays for posts — the site may have REST API disabled
-  or posts are in a custom post type.
-
   Strategy:
   1. Use Firecrawl basic proxy to scrape /lrf-in-action/news-articles/ (200 OK)
-  2. Parse article URLs from the listing markdown
+  2. Parse article URLs from the listing markdown — only /lrf-in-action/ paths
   3. For each new URL, scrape the individual article page
   4. Extract title, date, case citation if present, PDF link if present
   5. Push to MutemoOS as ZLR entries (source: "LRF")
-
-  The /resources/publications/ URL has been removed — it 404s.
-  Only /lrf-in-action/news-articles/ is used as the listing source.
 """
 
 import logging
@@ -35,36 +28,36 @@ import state
 
 logger = logging.getLogger(__name__)
 
-# Only the working listing URL
 LISTING_URLS = [
     "https://lrfzim.com/lrf-in-action/news-articles/",
 ]
 BASE_URL = "https://lrfzim.com"
 
-# Article URL pattern — match lrfzim.com article paths
+# Only match actual article URLs under /lrf-in-action/ — not thematic areas or pages
 RE_ARTICLE_URL = re.compile(
-    r"https://lrfzim\.com/(?!wp-|xmlrpc|feed|sitemap|category|tag|author|page)"
-    r"[a-z0-9\-]+/[a-z0-9\-/]+"
+    r"https://lrfzim\.com/lrf-in-action/(?!news-articles/?$)[a-z0-9\-]+/?"
 )
-RE_DATE        = re.compile(
+
+RE_DATE     = re.compile(
     r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
     r"August|September|October|November|December)\s+\d{4})\b"
 )
-RE_PDF_LINK    = re.compile(r"\[.*?\]\((https?://[^\)]+\.pdf[^\)]*)\)", re.IGNORECASE)
-RE_TITLE       = re.compile(r"^#\s+(.+)$", re.MULTILINE)
-RE_CITATION    = re.compile(
+RE_PDF_LINK = re.compile(r"\[.*?\]\((https?://[^\)]+\.pdf[^\)]*)\)", re.IGNORECASE)
+RE_TITLE    = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+RE_CITATION = re.compile(
     r"\b(ZWSC|ZWCC|ZWHHC|ZWBHC|ZWLC|SC|HH|HC|HB)\s*\d+[-/]\d{2,4}\b",
     re.IGNORECASE,
 )
-RE_CASE_NAME   = re.compile(
+RE_CASE_NAME = re.compile(
     r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+v\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"
 )
 
-# Exclude navigation/utility links
 EXCLUDE_PATTERNS = [
     "/wp-content/", "/wp-admin/", "/wp-json/", "/feed/", "/xmlrpc",
-    "#", "mailto:", "tel:", "/about", "/contact", "/donate",
-    "/lrf-in-action/news-articles/",  # exclude the listing page itself
+    "#", "mailto:", "tel:",
+    "/thematic-areas/", "/about", "/contact", "/donate",
+    "/press-statements", "/events", "/resources",
+    "/lrf-in-action/news-articles/",
 ]
 
 
@@ -101,13 +94,11 @@ async def _get_listing_urls() -> list[str]:
             logger.warning(f"[lrf] Empty markdown from {listing_url}")
             continue
 
-        # Extract all lrfzim.com article URLs from markdown
         found = RE_ARTICLE_URL.findall(md)
         for url in found:
             if not _is_excluded(url) and url not in all_urls:
                 all_urls.append(url)
 
-    # Deduplicate preserving order
     seen: set[str] = set()
     unique: list[str] = []
     for u in all_urls:
@@ -132,13 +123,12 @@ async def _scrape_article(url: str, dry_run: bool = False) -> Optional[DigestIte
         logger.warning(f"[lrf] Empty or very short markdown for {url}")
         return None
 
-    # Skip pages that are clearly not articles (404 pages, login walls, etc.)
     if any(phrase in md.lower() for phrase in ["page not found", "404", "access denied"]):
         logger.warning(f"[lrf] Skipping non-article page: {url}")
         return None
 
     title_m = RE_TITLE.search(md)
-    title = title_m.group(1).strip() if title_m else "LRF Case Digest"
+    title = title_m.group(1).strip() if title_m else url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
     citation_m = RE_CITATION.search(md)
     citation = citation_m.group(0).strip() if citation_m else None
@@ -198,9 +188,7 @@ async def run(dry_run: bool = False) -> list[DigestItem]:
             continue
 
         if dry_run:
-            logger.info(
-                f"[DRY RUN] Would push: {item.title} ({item.citation}) — {url}"
-            )
+            logger.info(f"[DRY RUN] Would push: {item.title} ({item.citation}) — {url}")
         else:
             state.mark_seen(url)
 

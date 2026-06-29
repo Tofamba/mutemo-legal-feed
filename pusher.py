@@ -5,6 +5,7 @@ Pushes:
   - ZimLII judgments → POST /api/zlr/upload  (multipart with PDF or text)
   - Veritas legislation → POST /api/legal-updates/upload  (multipart with PDF or text)
   - LRF digests → POST /api/zlr/upload  (multipart with PDF or text, source=LRF)
+  - News articles → POST /api/legal-updates/upload  (text file)
 
 Retry policy:
   - 3 attempts with exponential backoff: 5s, 15s, 45s
@@ -33,6 +34,7 @@ import state
 from scrapers.zimlii import JudgmentItem
 from scrapers.veritas import LegislationItem
 from scrapers.lrf import DigestItem
+from scrapers.news import NewsItem
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +45,10 @@ CF_CLIENT_ID        = os.environ.get("CF_CLIENT_ID", "")
 CF_CLIENT_SECRET    = os.environ.get("CF_CLIENT_SECRET", "")
 
 MAX_RETRIES   = 3
-RETRY_DELAYS  = [5, 15, 45]   # seconds between attempts
-PUSH_TIMEOUT  = 120            # seconds — PDF uploads can be slow
+RETRY_DELAYS  = [5, 15, 45]
+PUSH_TIMEOUT  = 120
 
-FeedItem = Union[JudgmentItem, LegislationItem, DigestItem]
+FeedItem = Union[JudgmentItem, LegislationItem, DigestItem, NewsItem]
 
 
 def _build_headers() -> dict:
@@ -66,8 +68,8 @@ def _make_text_file(item: Union[JudgmentItem, DigestItem]) -> tuple:
     """Build a text file tuple from judgment metadata when no PDF is available."""
     content = "\n".join([
         f"URL: {item.url}",
-        f"CASE: {item.case_name or ''}",
-        f"CITATION: {item.citation or ''}",
+        f"CASE: {getattr(item, 'case_name', '') or getattr(item, 'title', '')}",
+        f"CITATION: {getattr(item, 'citation', '') or ''}",
         f"COURT: {getattr(item, 'court', '') or ''}",
         f"JUDGE: {getattr(item, 'judge', '') or ''}",
         f"DATE: {getattr(item, 'judgment_date', '') or getattr(item, 'doc_date', '') or ''}",
@@ -75,7 +77,8 @@ def _make_text_file(item: Union[JudgmentItem, DigestItem]) -> tuple:
         "",
         item.markdown_summary or "",
     ])
-    filename = f"{(item.case_name or 'judgment').replace(' ', '_')[:60]}.txt"
+    name = getattr(item, 'case_name', None) or getattr(item, 'title', None) or 'judgment'
+    filename = f"{name.replace(' ', '_')[:60]}.txt"
     return (filename, content.encode("utf-8"), "text/plain")
 
 
@@ -178,6 +181,42 @@ async def _push_legal_update(item: LegislationItem, client: httpx.AsyncClient) -
                 pass
 
 
+async def _push_news_item(item: NewsItem, client: httpx.AsyncClient) -> bool:
+    """Push a news article to /api/legal-updates/upload."""
+    url = f"{MUTEMOS_BASE_URL}/api/legal-updates/upload"
+
+    form_data = {
+        "source_type": "news",
+        "source_name": item.source,
+        "reference": item.title[:200],
+    }
+
+    content = "\n".join([
+        f"SOURCE: {item.source}",
+        f"URL: {item.url}",
+        f"TITLE: {item.title}",
+        f"DATE: {item.doc_date or ''}",
+        "",
+        item.markdown_summary or "",
+    ])
+    filename = f"{item.title.replace(' ', '_')[:60]}.txt"
+    files = {"file": (filename, content.encode("utf-8"), "text/plain")}
+
+    try:
+        resp = await client.post(url, data=form_data, files=files, headers=_build_headers())
+
+        if resp.status_code in (200, 201, 202):
+            logger.info(f"[pusher] ✓ News pushed: {item.title[:60]}")
+            state.increment_pushed()
+            return True
+        else:
+            logger.warning(f"[pusher] News push failed {resp.status_code}: {resp.text[:200]}")
+            return False
+
+    except Exception:
+        raise
+
+
 async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
     """
     Push a feed item to MutemoOS with exponential backoff retry.
@@ -197,7 +236,10 @@ async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
             try:
                 if isinstance(item, LegislationItem):
                     success = await _push_legal_update(item, client)
+                elif isinstance(item, NewsItem):
+                    success = await _push_news_item(item, client)
                 else:
+                    # JudgmentItem and DigestItem both go to ZLR
                     success = await _push_zlr_entry(item, client)
 
                 if success:
@@ -219,7 +261,7 @@ async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
     state.log_push_failure({
         "url": item.url,
         "source": item.source,
-        "title": getattr(item, "case_name", None) or getattr(item, "title", "unknown"),
+        "title": getattr(item, "title", None) or getattr(item, "case_name", "unknown"),
     })
     return False
 

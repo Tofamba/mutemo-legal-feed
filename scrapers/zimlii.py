@@ -200,7 +200,7 @@ async def _scrape_judgment(url: str, dry_run: bool = False) -> Optional[Judgment
     # Download PDF (skip in dry-run)
     if not dry_run and pdf_url:
         try:
-            item.pdf_path = await download_pdf(pdf_url)
+            item.pdf_path = await download_pdf(pdf_url, use_stealth=True)
         except Exception as e:
             logger.warning(f"[zimlii] PDF download failed for {url}: {e}")
             item.pdf_path = None

@@ -15,6 +15,10 @@ Authentication:
   MutemoOS v2 uses OTP-based sessions. For the feed service we use the
   MUTEMOS_ADMIN_TOKEN header (X-Admin-Token) which bypasses OTP for
   machine-to-machine calls. Set MUTEMOS_ADMIN_TOKEN in env vars.
+  
+  Cloudflare Access is bypassed using a service token (CF_CLIENT_ID and
+  CF_CLIENT_SECRET) sent as CF-Access-Client-Id and CF-Access-Client-Secret
+  headers on every request.
 """
 
 import asyncio
@@ -32,9 +36,11 @@ from scrapers.lrf import DigestItem
 
 logger = logging.getLogger(__name__)
 
-MUTEMOS_BASE_URL   = os.environ.get("MUTEMOS_BASE_URL", "https://mutemoos-production.up.railway.app")
+MUTEMOS_BASE_URL    = os.environ.get("MUTEMOS_BASE_URL", "https://mutemoos-production.up.railway.app")
 MUTEMOS_ADMIN_TOKEN = os.environ.get("MUTEMOS_ADMIN_TOKEN", "")
-MUTEMOS_FIRM_ID    = os.environ.get("MUTEMOS_FIRM_ID", "")
+MUTEMOS_FIRM_ID     = os.environ.get("MUTEMOS_FIRM_ID", "")
+CF_CLIENT_ID        = os.environ.get("CF_CLIENT_ID", "")
+CF_CLIENT_SECRET    = os.environ.get("CF_CLIENT_SECRET", "")
 
 MAX_RETRIES   = 3
 RETRY_DELAYS  = [5, 15, 45]   # seconds between attempts
@@ -49,6 +55,10 @@ def _build_headers() -> dict:
         headers["X-Admin-Token"] = MUTEMOS_ADMIN_TOKEN
     if MUTEMOS_FIRM_ID:
         headers["X-Firm-ID"] = MUTEMOS_FIRM_ID
+    if CF_CLIENT_ID:
+        headers["CF-Access-Client-Id"] = CF_CLIENT_ID
+    if CF_CLIENT_SECRET:
+        headers["CF-Access-Client-Secret"] = CF_CLIENT_SECRET
     return headers
 
 
@@ -56,7 +66,6 @@ async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem], client: httpx.A
     """Push a judgment or LRF digest to /api/zlr/upload."""
     url = f"{MUTEMOS_BASE_URL}/api/zlr/upload"
 
-    # Build multipart form data
     form_data = {
         "source": item.source,
         "case_name": item.case_name or item.title if hasattr(item, "title") else (item.case_name or "Unknown"),
@@ -74,7 +83,6 @@ async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem], client: httpx.A
     if pdf_path and pdf_path.exists():
         files = {"file": (pdf_path.name, open(pdf_path, "rb"), "application/pdf")}
     else:
-        # No PDF — push metadata only (the backend will create a stub entry)
         logger.warning(f"[pusher] No PDF for {item.url} — pushing metadata only")
 
     try:
@@ -83,7 +91,7 @@ async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem], client: httpx.A
         else:
             resp = await client.post(url, data=form_data, headers=_build_headers())
 
-        if resp.status_code in (200, 201):
+        if resp.status_code in (200, 201, 202):
             logger.info(f"[pusher] ✓ ZLR pushed: {item.url}")
             state.increment_pushed()
             return True
@@ -93,7 +101,6 @@ async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem], client: httpx.A
     finally:
         if files:
             files["file"][1].close()
-        # Clean up downloaded PDF
         if pdf_path and pdf_path.exists():
             try:
                 pdf_path.unlink()
@@ -129,7 +136,7 @@ async def _push_legal_update(item: LegislationItem, client: httpx.AsyncClient) -
         else:
             resp = await client.post(url, data=form_data, headers=_build_headers())
 
-        if resp.status_code in (200, 201):
+        if resp.status_code in (200, 201, 202):
             logger.info(f"[pusher] ✓ Legal update pushed: {item.url}")
             state.increment_pushed()
             return True
@@ -149,7 +156,6 @@ async def _push_legal_update(item: LegislationItem, client: httpx.AsyncClient) -
 async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
     """
     Push a feed item to MutemoOS with exponential backoff retry.
-
     Returns True if pushed successfully, False if all retries exhausted.
     On final failure, logs to state.push_failures.
     """
@@ -167,7 +173,6 @@ async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
                 if isinstance(item, LegislationItem):
                     success = await _push_legal_update(item, client)
                 else:
-                    # JudgmentItem and DigestItem both go to ZLR
                     success = await _push_zlr_entry(item, client)
 
                 if success:
@@ -185,7 +190,6 @@ async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
                 logger.info(f"[pusher] Retrying in {delay}s...")
                 await asyncio.sleep(delay)
 
-    # All retries exhausted
     logger.error(f"[pusher] All {MAX_RETRIES} attempts failed for {item.url}")
     state.log_push_failure({
         "url": item.url,
@@ -206,7 +210,6 @@ async def push_batch(items: list[FeedItem], dry_run: bool = False) -> dict:
             pushed += 1
         else:
             failed += 1
-        # Small delay between pushes to avoid hammering MutemoOS
         await asyncio.sleep(1)
 
     return {"pushed": pushed, "failed": failed, "total": len(items)}

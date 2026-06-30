@@ -1,15 +1,13 @@
 """
 scrapers/zlhr.py — Zimbabwe Lawyers for Human Rights scraper.
 
-ZLHR (https://zlhr.org.zw) publishes press statements and case updates
-on human rights litigation in Zimbabwe. Simple WordPress site, no
-Cloudflare protection.
+ZLHR (https://zlhr.org.zw) publishes press statements and case updates on
+human rights litigation in Zimbabwe. Simple WordPress site, no Cloudflare
+protection — uses Firecrawl basic proxy only.
 
-Strategy:
-1. Scrape the ZLHR lead story category page for recent case updates
-2. Filter URLs by legal keywords in the slug
-3. Scrape each article and extract metadata
-4. Push to MutemoOS as legal updates
+Pushes via _push_legal_update (legislation/news path), NOT _push_zlr_entry —
+ZLHR press statements are not case law and don't belong in the Case Law
+Index. This matches how Veritas legislation is handled.
 
 Schedule: weekdays at 06:00 UTC (08:00 CAT)
 Credit budget: 1 credit/listing + 1 credit/article × up to 10 = ~11 credits/run
@@ -18,6 +16,7 @@ Credit budget: 1 credit/listing + 1 credit/article × up to 10 = ~11 credits/run
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -26,15 +25,17 @@ import state
 
 logger = logging.getLogger(__name__)
 
+# Category listing, not the homepage — homepage surfaces nav pages
 LISTING_URL = "https://www.zlhr.org.zw/category/lead-story/"
 BASE_URL    = "https://www.zlhr.org.zw"
 
-# Match ZLHR article URLs — slugs with at least 10 chars
+# Match article slugs, at least 10 chars to avoid short nav-page matches
 RE_ARTICLE_URL = re.compile(
     r"https://www\.zlhr\.org\.zw/[a-z0-9][a-z0-9\-]{10,}/?"
 )
 
-# Keywords that indicate a real case/court article slug
+# Keywords that indicate a real case/court article slug — distinct from
+# the EXCLUDE_PATTERNS below, this is a positive-match requirement
 ARTICLE_KEYWORDS = [
     "court", "high-court", "acquit", "freed", "detained", "arrested",
     "sentence", "judge", "bail", "conviction", "quash", "appeal",
@@ -47,7 +48,7 @@ ARTICLE_KEYWORDS = [
     "torture", "police", "zrp", "zanu", "opposition",
 ]
 
-RE_DATE  = re.compile(
+RE_DATE = re.compile(
     r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
     r"August|September|October|November|December)\s+\d{4})\b"
 )
@@ -56,10 +57,9 @@ RE_CITATION = re.compile(
     r"\b(ZWSC|ZWCC|ZWHHC|ZWBHC|ZWLC|SC|HH|HC|HB)\s*\d+[-/]\d{2,4}\b",
     re.IGNORECASE,
 )
-RE_CASE_NAME = re.compile(
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+v\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"
-)
 
+# Hard exclude — known navigation/utility pages that should never match,
+# even if they happen to contain an ARTICLE_KEYWORDS hit
 EXCLUDE_PATTERNS = [
     "/wp-content/", "/wp-admin/", "/wp-json/", "/feed/",
     "#", "mailto:", "tel:",
@@ -91,16 +91,18 @@ def _is_article(url: str) -> bool:
 
 @dataclass
 class ZLHRItem:
+    """Shaped to match what _push_legal_update expects in pusher.py."""
     url: str
     title: str
-    case_name: Optional[str]
-    citation: Optional[str]
-    doc_date: Optional[str]
+    citation: Optional[str] = None
+    doc_date: Optional[str] = None
     pdf_url: Optional[str] = None
     pdf_path: Optional[Path] = None
     source: str = "ZLHR"
     source_type: str = "news"
+    reference: Optional[str] = None
     markdown_summary: str = ""
+    scraped_at: Optional[object] = None  # datetime, set at scrape time
 
 
 async def _get_listing_urls() -> list[str]:
@@ -149,19 +151,17 @@ async def _scrape_article(url: str) -> Optional[ZLHRItem]:
     citation_m = RE_CITATION.search(md)
     citation = citation_m.group(0).strip() if citation_m else None
 
-    case_name_m = RE_CASE_NAME.search(md)
-    case_name = case_name_m.group(0).strip() if case_name_m else None
-
     date_m = RE_DATE.search(md)
     doc_date = date_m.group(1).strip() if date_m else None
 
     return ZLHRItem(
         url=url,
         title=title,
-        case_name=case_name,
         citation=citation,
         doc_date=doc_date,
+        reference=title[:200],
         markdown_summary=md[:800].strip(),
+        scraped_at=datetime.now(timezone.utc),
     )
 
 

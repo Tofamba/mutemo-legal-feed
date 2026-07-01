@@ -2,24 +2,25 @@
 scrapers/lrf.py — Legal Resources Foundation (LRF) case digest scraper.
 
 CORRECT URL STRUCTURE (verified 2026-06-28):
-  lrfzim.com is a WordPress site. Direct URL checks showed:
-    /lrf-in-action/news-articles/  → 200 OK (correct)
-    /resources/publications/       → 404 (broken — page does not exist)
-    /resources/                    → 301 redirect to #  (broken)
-    /case-law/                     → 404
-    /category/publications/        → 404
+  lrfzim.com is a WordPress site.
+    /lrf-in-action/news-articles/  → 200 OK (listing page)
+    Article URLs: /lrf-in-action/{article-slug}/
 
   Strategy:
-  1. Use Firecrawl basic proxy to scrape /lrf-in-action/news-articles/ (200 OK)
-  2. Parse article URLs from the listing markdown — only /lrf-in-action/ paths
-  3. For each new URL, scrape the individual article page
-  4. Extract title, date, case citation if present, PDF link if present
-  5. Push to MutemoOS as ZLR entries (source: "LRF")
+  1. Scrape /lrf-in-action/news-articles/ via Firecrawl basic proxy
+  2. Extract only /lrf-in-action/ article URLs (not thematic areas, not press statements)
+  3. Apply ARTICLE_KEYWORDS check on slug — must look like a real article
+  4. Scrape each article, extract metadata
+  5. Push to MutemoOS via _push_zlr_entry (source: "LRF")
+
+Schedule: Mondays at 05:00 UTC (07:00 CAT)
+Credit budget: 1 credit/listing + 1 credit/article × up to 10 = ~11 credits/run
 """
 
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -33,10 +34,22 @@ LISTING_URLS = [
 ]
 BASE_URL = "https://lrfzim.com"
 
-# Only match actual article URLs under /lrf-in-action/ — not thematic areas or pages
+# Only match article URLs under /lrf-in-action/ with at least 10-char slugs
+# Excludes the listing page itself and short nav slugs
 RE_ARTICLE_URL = re.compile(
-    r"https://lrfzim\.com/lrf-in-action/(?!news-articles/?$)[a-z0-9\-]+/?"
+    r"https://lrfzim\.com/lrf-in-action/[a-z0-9][a-z0-9\-]{9,}/?"
 )
+
+# Keywords that indicate a real article slug vs a navigation/category page
+ARTICLE_KEYWORDS = [
+    "court", "high-court", "judgment", "ruling", "case", "appeal",
+    "rights", "human-rights", "legal", "law", "justice", "lawyer",
+    "advocate", "prosecution", "accused", "bail", "sentence", "convicted",
+    "acquitted", "constitution", "constitutional", "tribunal", "magistrate",
+    "digest", "update", "report", "bulletin", "newsletter",
+    "parliament", "legislation", "statutory", "regulation",
+    "police", "arrest", "detention", "prison", "release", "trial",
+]
 
 RE_DATE     = re.compile(
     r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
@@ -58,11 +71,19 @@ EXCLUDE_PATTERNS = [
     "/thematic-areas/", "/about", "/contact", "/donate",
     "/press-statements", "/events", "/resources",
     "/lrf-in-action/news-articles/",
+    "/strengthening-justice", "/legal-education",
+    "/legal-services", "/research-and-advocacy",
 ]
 
 
 def _is_excluded(url: str) -> bool:
     return any(pat in url for pat in EXCLUDE_PATTERNS)
+
+
+def _is_article(url: str) -> bool:
+    """Return True if the URL slug looks like a real article."""
+    slug = url.rstrip("/").split("/")[-1].lower()
+    return any(kw in slug for kw in ARTICLE_KEYWORDS)
 
 
 @dataclass
@@ -76,6 +97,7 @@ class DigestItem:
     pdf_path: Optional[Path]
     source: str = "LRF"
     markdown_summary: str = ""
+    scraped_at: Optional[object] = None  # datetime, set at scrape time
 
 
 async def _get_listing_urls() -> list[str]:
@@ -96,7 +118,7 @@ async def _get_listing_urls() -> list[str]:
 
         found = RE_ARTICLE_URL.findall(md)
         for url in found:
-            if not _is_excluded(url) and url not in all_urls:
+            if not _is_excluded(url) and _is_article(url) and url not in all_urls:
                 all_urls.append(url)
 
     seen: set[str] = set()
@@ -128,7 +150,8 @@ async def _scrape_article(url: str, dry_run: bool = False) -> Optional[DigestIte
         return None
 
     title_m = RE_TITLE.search(md)
-    title = title_m.group(1).strip() if title_m else url.rstrip("/").split("/")[-1].replace("-", " ").title()
+    title = title_m.group(1).strip() if title_m else \
+        url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
     citation_m = RE_CITATION.search(md)
     citation = citation_m.group(0).strip() if citation_m else None
@@ -153,6 +176,7 @@ async def _scrape_article(url: str, dry_run: bool = False) -> Optional[DigestIte
         pdf_url=pdf_url,
         pdf_path=None,
         markdown_summary=summary,
+        scraped_at=datetime.now(timezone.utc),
     )
 
     if not dry_run and pdf_url:

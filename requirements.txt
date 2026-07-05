@@ -1,7 +1,7 @@
-fastapi==0.111.0
+﻿fastapi==0.111.0
 uvicorn==0.29.0
 crawl4ai==0.6.3
-httpx==0.27.0
+httpx>=0.27.2
 python-dotenv==1.0.0
 pytz
 pdfplumber==0.11.0

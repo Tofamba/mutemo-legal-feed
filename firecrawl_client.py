@@ -1,12 +1,28 @@
 """
-firecrawl_client.py — Thin async wrapper around the Firecrawl v1 scrape API.
+firecrawl_client.py — Drop-in replacement using Crawl4AI instead of Firecrawl.
 
-Firecrawl API reference: https://docs.firecrawl.dev/api-reference/endpoint/scrape
+Preserves the exact same interface as the original Firecrawl wrapper:
+    scrape_page()     → returns dict with markdown and metadata
+    scrape_markdown() → returns markdown string
+    download_pdf()    → downloads PDF to temp file, returns Path
+    FirecrawlError    → same exception class name
 
-Credit costs (free tier: 500/month):
-  - basic proxy:   1 credit per page
-  - stealth proxy: 5 credits per page (used for Cloudflare-protected sites)
-  - PDF (parsePDF=false): 1 credit flat (we download the raw file ourselves)
+No API key needed. No credit limits. Self-hosted via Crawl4AI + Playwright.
+
+Crawl4AI install (added to requirements.txt):
+    crawl4ai==0.6.3
+    playwright (installed automatically by crawl4ai)
+
+On first run, Playwright browsers must be installed:
+    python -m playwright install chromium
+
+Railway: Add a Dockerfile RUN step or startup command:
+    RUN python -m playwright install chromium --with-deps
+
+Proxy modes (mapped from Firecrawl terminology):
+    "basic"   → standard Playwright headless browser (fast, no stealth)
+    "stealth" → Playwright with stealth plugin (bypasses basic bot detection)
+    "auto"    → same as "basic" (Crawl4AI handles JS rendering by default)
 """
 
 import asyncio
@@ -20,14 +36,61 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
-FIRECRAWL_BASE    = "https://api.firecrawl.dev/v1"
-SCRAPE_TIMEOUT    = 60   # seconds — Firecrawl can be slow on stealth mode
-DOWNLOAD_TIMEOUT  = 120  # seconds — PDF downloads can be large
+SCRAPE_TIMEOUT   = 60    # seconds
+DOWNLOAD_TIMEOUT = 120   # seconds
+
+# Crawl4AI import — graceful fallback if not installed
+try:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+    from crawl4ai.content_filter_strategy import PruningContentFilter
+    from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    CRAWL4AI_AVAILABLE = False
+    logger.warning("[crawl4ai] crawl4ai not installed — falling back to httpx-only mode")
 
 
 class FirecrawlError(Exception):
+    """Same exception class as original firecrawl_client.py for drop-in compatibility."""
     pass
+
+
+def _get_browser_config(proxy: str) -> "BrowserConfig":
+    """Map Firecrawl proxy modes to Crawl4AI BrowserConfig."""
+    use_stealth = proxy == "stealth"
+    return BrowserConfig(
+        browser_type="chromium",
+        headless=True,
+        verbose=False,
+        extra_args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+        # Stealth mode — randomises fingerprint to bypass bot detection
+        use_managed_browser=use_stealth,
+    )
+
+
+def _get_run_config(only_main_content: bool, wait_ms: int) -> "CrawlerRunConfig":
+    """Build Crawl4AI run config matching Firecrawl behaviour."""
+    md_generator = DefaultMarkdownGenerator(
+        content_filter=PruningContentFilter(
+            threshold=0.4,
+            threshold_type="fixed",
+            min_word_threshold=5,
+        ) if only_main_content else None,
+    )
+    return CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,  # always fresh — no stale cache
+        markdown_generator=md_generator,
+        wait_until="networkidle",
+        page_timeout=SCRAPE_TIMEOUT * 1000,  # ms
+        delay_before_return_html=wait_ms / 1000 if wait_ms > 0 else 0,
+        remove_overlay_elements=True,
+        simulate_user=True,
+    )
 
 
 async def scrape_page(
@@ -37,9 +100,7 @@ async def scrape_page(
     wait_ms: int = 0,
 ) -> dict:
     """
-    Scrape a URL and return the Firecrawl response dict.
-
-    Returns a dict with at minimum:
+    Scrape a URL and return a dict compatible with the Firecrawl response format:
         {
             "markdown": "...",
             "metadata": {
@@ -47,50 +108,50 @@ async def scrape_page(
                 "description": "...",
                 "url": "...",
                 "statusCode": 200,
-                ...
             }
         }
 
-    Raises FirecrawlError on API errors or non-200 responses.
+    Raises FirecrawlError on failures.
     """
-    if not FIRECRAWL_API_KEY:
-        raise FirecrawlError("FIRECRAWL_API_KEY environment variable not set.")
-
-    payload = {
-        "url": url,
-        "formats": ["markdown"],
-        "onlyMainContent": only_main_content,
-        "proxy": proxy,
-    }
-    if wait_ms > 0:
-        payload["waitFor"] = wait_ms
-
-    headers = {
-        "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=SCRAPE_TIMEOUT) as client:
-        resp = await client.post(
-            f"{FIRECRAWL_BASE}/scrape",
-            json=payload,
-            headers=headers,
-        )
-
-    if resp.status_code == 402:
-        raise FirecrawlError("Firecrawl credit limit reached (402). Check your plan.")
-    if resp.status_code == 429:
-        raise FirecrawlError("Firecrawl rate limit hit (429). Slow down requests.")
-    if resp.status_code != 200:
+    if not CRAWL4AI_AVAILABLE:
         raise FirecrawlError(
-            f"Firecrawl API error {resp.status_code}: {resp.text[:300]}"
+            "crawl4ai is not installed. Run: pip install crawl4ai && python -m playwright install chromium"
         )
 
-    data = resp.json()
-    if not data.get("success"):
-        raise FirecrawlError(f"Firecrawl returned success=false: {data}")
+    browser_config = _get_browser_config(proxy)
+    run_config     = _get_run_config(only_main_content, wait_ms)
 
-    return data.get("data", {})
+    try:
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            result = await crawler.arun(url=url, config=run_config)
+
+        if not result.success:
+            raise FirecrawlError(
+                f"Crawl4AI failed for {url}: {result.error_message or 'unknown error'}"
+            )
+
+        markdown = result.markdown.fit_markdown if result.markdown else ""
+        if not markdown and result.markdown:
+            markdown = result.markdown.raw_markdown or ""
+
+        # Build metadata dict matching Firecrawl's format
+        metadata = {
+            "title":       result.metadata.get("title", "") if result.metadata else "",
+            "description": result.metadata.get("description", "") if result.metadata else "",
+            "url":         url,
+            "sourceURL":   url,
+            "statusCode":  result.status_code or 200,
+        }
+
+        logger.info(f"[crawl4ai] ✓ Scraped {url} ({len(markdown)} chars)")
+        return {"markdown": markdown, "metadata": metadata}
+
+    except FirecrawlError:
+        raise
+    except asyncio.TimeoutError:
+        raise FirecrawlError(f"Crawl4AI timed out scraping: {url}")
+    except Exception as e:
+        raise FirecrawlError(f"Crawl4AI error scraping {url}: {e}")
 
 
 async def scrape_markdown(
@@ -104,102 +165,58 @@ async def scrape_markdown(
     return data.get("markdown", "")
 
 
-async def download_pdf(url: str, dest_dir: Optional[Path] = None, use_stealth: bool = False) -> Path:
+async def download_pdf(
+    url: str,
+    dest_dir: Optional[Path] = None,
+    use_stealth: bool = False,
+) -> Path:
     """
     Download a PDF from a URL and save it to a temp file.
-
-    For Cloudflare-protected URLs (e.g. ZimLII source.pdf), set use_stealth=True.
-    This routes the download through Firecrawl's stealth proxy (5 credits) instead
-    of a direct httpx GET, bypassing the 403 that Cloudflare returns to bots.
-
-    For unprotected URLs (e.g. LRF WordPress), use_stealth=False (default, 0 credits).
-
     Returns the Path to the downloaded file.
     The caller is responsible for deleting the file after use.
+
+    For Cloudflare-protected PDFs, set use_stealth=True —
+    this uses Crawl4AI's stealth browser to bypass protection.
+    For unprotected PDFs, uses direct httpx download (faster).
     """
     if dest_dir is None:
         dest_dir = Path(tempfile.gettempdir())
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive a safe filename from the URL
     safe_name = url.rstrip("/").split("/")[-1]
     if not safe_name.lower().endswith(".pdf"):
         safe_name = safe_name + ".pdf"
-    # Sanitise
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in safe_name)
     dest_path = dest_dir / safe_name
 
-    if use_stealth:
-        # Route through Firecrawl stealth proxy to bypass Cloudflare.
-        # Costs 5 credits per PDF. Firecrawl scrapes the PDF page and returns
-        # the raw PDF bytes via its /scrape endpoint with formats=["rawHtml"].
-        # We then follow the canonical PDF URL returned in metadata.
-        logger.info(f"[pdf] Using Firecrawl stealth proxy for: {url}")
-
-        if not FIRECRAWL_API_KEY:
-            raise FirecrawlError("FIRECRAWL_API_KEY not set — cannot use stealth PDF download.")
-
-        payload = {
-            "url": url,
-            "formats": ["rawHtml"],
-            "proxy": "stealth",
-            "parsePDF": False,
-        }
-        headers_fc = {
-            "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=SCRAPE_TIMEOUT) as client:
-            resp = await client.post(
-                f"{FIRECRAWL_BASE}/scrape",
-                json=payload,
-                headers=headers_fc,
+    if use_stealth and CRAWL4AI_AVAILABLE:
+        logger.info(f"[pdf] Using Crawl4AI stealth browser for: {url}")
+        try:
+            browser_config = _get_browser_config("stealth")
+            run_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                wait_until="networkidle",
+                page_timeout=SCRAPE_TIMEOUT * 1000,
             )
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                result = await crawler.arun(url=url, config=run_config)
 
-        if resp.status_code == 402:
-            raise FirecrawlError("Firecrawl credit limit reached (402). Check your plan.")
-        if resp.status_code == 429:
-            raise FirecrawlError("Firecrawl rate limit hit (429). Slow down requests.")
-        if resp.status_code != 200:
-            raise FirecrawlError(
-                f"Firecrawl stealth PDF error {resp.status_code}: {resp.text[:300]}"
-            )
+            if result.success and result.downloaded_files:
+                # Crawl4AI may capture the PDF as a downloaded file
+                for f in result.downloaded_files:
+                    if f.endswith(".pdf"):
+                        import shutil
+                        shutil.copy(f, dest_path)
+                        logger.info(f"[pdf] Stealth download via Crawl4AI → {dest_path.name}")
+                        return dest_path
 
-        data = resp.json()
-        if not data.get("success"):
-            raise FirecrawlError(f"Firecrawl stealth PDF returned success=false: {data}")
+            # Fall back to direct download with browser-like headers
+            logger.info(f"[pdf] Stealth browser didn't capture PDF, trying direct download")
+        except Exception as e:
+            logger.warning(f"[pdf] Stealth browser error: {e} — trying direct download")
 
-        # Firecrawl returns the raw HTML/bytes of the PDF page.
-        # The actual PDF binary is in data["data"]["rawHtml"] as bytes or
-        # accessible via the sourceURL in metadata. Try to get the direct
-        # download URL from metadata first, then fall back to rawHtml content.
-        fc_data = data.get("data", {})
-        source_url = fc_data.get("metadata", {}).get("sourceURL") or url
-
-        # Now do a direct download using the resolved URL with a Firecrawl-style
-        # browser User-Agent — the stealth scrape will have set cookies that
-        # allow a subsequent direct download to succeed.
-        raw_html = fc_data.get("rawHtml", b"")
-        if isinstance(raw_html, str):
-            raw_html = raw_html.encode("utf-8", errors="replace")
-
-        if raw_html and len(raw_html) > 1024:
-            # Firecrawl returned the PDF content directly
-            with open(dest_path, "wb") as f:
-                f.write(raw_html)
-            size_kb = dest_path.stat().st_size // 1024
-            logger.info(f"[pdf] Stealth download via rawHtml {size_kb}KB → {dest_path.name}")
-            return dest_path
-        else:
-            # Fall back: try direct download with browser headers after stealth scrape
-            logger.info(f"[pdf] rawHtml empty, falling back to direct download: {source_url}")
-            # Fall through to direct download below with source_url
-            url = source_url
-            use_stealth = False  # prevent infinite recursion
-
-    # Direct download path (no Cloudflare protection, or fallback)
+    # Direct download via httpx with browser-like headers
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -209,30 +226,33 @@ async def download_pdf(url: str, dest_dir: Optional[Path] = None, use_stealth: b
         "Referer": "https://zimlii.org/",
     }
 
-    async with httpx.AsyncClient(
-        timeout=DOWNLOAD_TIMEOUT,
-        follow_redirects=True,
-        headers=headers,
-    ) as client:
-        async with client.stream("GET", url) as resp:
-            if resp.status_code == 403:
-                raise FirecrawlError(
-                    f"PDF download blocked by Cloudflare (403): {url}. "
-                    f"Set use_stealth=True to route through Firecrawl."
-                )
-            if resp.status_code != 200:
-                raise FirecrawlError(
-                    f"PDF download failed {resp.status_code}: {url}"
-                )
-            content_type = resp.headers.get("content-type", "")
-            if "pdf" not in content_type and "octet-stream" not in content_type:
-                logger.warning(
-                    f"[pdf] Unexpected content-type '{content_type}' for {url}"
-                )
-            with open(dest_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    f.write(chunk)
+    try:
+        async with httpx.AsyncClient(
+            timeout=DOWNLOAD_TIMEOUT,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code == 403:
+                    raise FirecrawlError(
+                        f"PDF download blocked (403): {url}. Set use_stealth=True."
+                    )
+                if resp.status_code != 200:
+                    raise FirecrawlError(
+                        f"PDF download failed {resp.status_code}: {url}"
+                    )
+                content_type = resp.headers.get("content-type", "")
+                if "pdf" not in content_type and "octet-stream" not in content_type:
+                    logger.warning(f"[pdf] Unexpected content-type '{content_type}' for {url}")
+                with open(dest_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
 
-    size_kb = dest_path.stat().st_size // 1024
-    logger.info(f"[pdf] Downloaded {size_kb}KB → {dest_path.name}")
-    return dest_path
+        size_kb = dest_path.stat().st_size // 1024
+        logger.info(f"[pdf] Downloaded {size_kb}KB → {dest_path.name}")
+        return dest_path
+
+    except FirecrawlError:
+        raise
+    except Exception as e:
+        raise FirecrawlError(f"PDF download error for {url}: {e}")

@@ -85,8 +85,8 @@ def _get_run_config(only_main_content: bool, wait_ms: int) -> "CrawlerRunConfig"
     return CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,  # always fresh — no stale cache
         markdown_generator=md_generator,
-        wait_until="networkidle",
-        page_timeout=SCRAPE_TIMEOUT * 1000,  # ms
+        wait_until="domcontentloaded",
+        page_timeout=30000,  # ms
         delay_before_return_html=wait_ms / 1000 if wait_ms > 0 else 0,
         remove_overlay_elements=True,
         simulate_user=True,
@@ -196,8 +196,8 @@ async def download_pdf(
             browser_config = _get_browser_config("stealth")
             run_config = CrawlerRunConfig(
                 cache_mode=CacheMode.BYPASS,
-                wait_until="networkidle",
-                page_timeout=SCRAPE_TIMEOUT * 1000,
+                wait_until="domcontentloaded",
+                page_timeout=30000,
             )
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 result = await crawler.arun(url=url, config=run_config)

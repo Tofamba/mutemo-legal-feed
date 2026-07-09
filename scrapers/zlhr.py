@@ -187,8 +187,7 @@ async def run(dry_run: bool = False) -> list[ZLHRItem]:
 
         if dry_run:
             logger.info(f"[DRY RUN] Would push: {item.title} — {url}")
-        else:
-            state.mark_seen(url)
+        # mark_seen() now happens in pusher.py, only after a push succeeds.
 
         new_items.append(item)
 

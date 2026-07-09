@@ -51,6 +51,7 @@ from scrapers.veritas import LegislationItem
 from scrapers.lrf import DigestItem
 from scrapers.news import NewsItem
 from scrapers.zlhr import ZLHRItem
+from scrapers.lawsafrica import LawsAfricaItem
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ MAX_RETRIES  = 3
 RETRY_DELAYS = [5, 15, 45]   # seconds between attempts
 PUSH_TIMEOUT = 120            # seconds — PDF uploads can be slow
 
-FeedItem = Union[JudgmentItem, LegislationItem, DigestItem, NewsItem, ZLHRItem]
+FeedItem = Union[JudgmentItem, LegislationItem, DigestItem, NewsItem, ZLHRItem, LawsAfricaItem]
 
 
 # ── Firm Registry ─────────────────────────────────────────────────────────────
@@ -142,6 +143,17 @@ def validate_item(item: FeedItem) -> tuple[bool, str]:
 
     if not url:
         return False, "no source URL"
+
+    # Laws.Africa items carry structured API metadata, not scraped full
+    # text — the summary is a short synthetic string (title/date/court/
+    # citation), so the generic 150-char "is this real content" check
+    # doesn't apply here. Validate on the fields that actually matter instead.
+    if isinstance(item, LawsAfricaItem):
+        if not item.frbr_uri:
+            return False, "no FRBR URI"
+        if not item.title:
+            return False, "no title"
+        return True, "ok"
 
     if len(text.strip()) < 150:
         return False, f"content too short ({len(text.strip())} chars) — likely truncated or empty"
@@ -294,6 +306,56 @@ async def _push_legal_update(item: Union[LegislationItem, ZLHRItem],
                 pass
 
 
+async def _push_lawsafrica_item(item: LawsAfricaItem,
+                                client: httpx.AsyncClient,
+                                firm: FirmConfig) -> bool:
+    """
+    Push a Laws.Africa item — routes by item.source_type since this single
+    scraper covers both judgments ("case_law") and legislation ("legislation"),
+    unlike every other scraper which is dedicated to one document type.
+    """
+    if item.source_type == "case_law":
+        url = f"{firm.base_url}/api/zlr/upload"
+        form_data = {
+            "source":         item.source,
+            "case_name":      item.title or "Unknown",
+            "citation":       item.citation or "",
+            "court":          item.court or "",
+            "judge":          "",
+            "judgment_date":  item.doc_date or "",
+            "zimlii_url":     item.url,
+            "source_url":     item.url,
+            "summary":        (item.markdown_summary or "")[:500],
+            "scraped_at":     "",
+        }
+    else:
+        url = f"{firm.base_url}/api/legal-updates/upload"
+        form_data = {
+            "source_type": "legislation",
+            "source_name": item.source,
+            "reference":   item.title or "",
+            "doc_date":    item.doc_date or "",
+            "title":       item.title or "",
+            "summary":     (item.markdown_summary or "")[:500],
+            "source_url":  item.url,
+            "scraped_at":  "",
+        }
+
+    # Laws.Africa is a metadata API — there's no PDF to attach, ever.
+    # Both endpoints accept a metadata-only push (file is optional).
+    try:
+        resp = await client.post(url, data=form_data, headers=_build_headers(firm))
+        if resp.status_code in (200, 201, 202):
+            logger.info(f"[pusher/{firm.name}] ✓ Laws.Africa pushed ({item.source_type}): {item.url}")
+            return True
+        else:
+            logger.warning(f"[pusher/{firm.name}] Laws.Africa push failed {resp.status_code}: {resp.text[:200]}")
+            return False
+    except Exception as e:
+        logger.error(f"[pusher/{firm.name}] Laws.Africa push error for {item.url}: {e}")
+        return False
+
+
 async def _push_to_firm(item: FeedItem,
                         firm: FirmConfig,
                         client: httpx.AsyncClient) -> bool:
@@ -302,6 +364,8 @@ async def _push_to_firm(item: FeedItem,
         try:
             if isinstance(item, NewsItem):
                 success = await _push_news_item(item, client, firm)
+            elif isinstance(item, LawsAfricaItem):
+                success = await _push_lawsafrica_item(item, client, firm)
             elif isinstance(item, (LegislationItem, ZLHRItem)):
                 success = await _push_legal_update(item, client, firm)
             else:
@@ -336,13 +400,9 @@ async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
 
     Returns True if pushed successfully to at least one firm.
     """
-    # Validation gate
-    valid, reason = validate_item(item)
-    if not valid:
-        logger.warning(f"[pusher] ✗ Rejected: {getattr(item, 'url', '?')} — {reason}")
-        state.increment_skipped()
-        return False
-
+    # Note: validation happens once, in push_batch, before this is ever
+    # called — push_with_retry has no other caller, so re-validating here
+    # was pure duplicate work on every single item.
     if dry_run:
         logger.info(f"[DRY RUN] Would push to {len(FIRMS)} firm(s): {item.url}")
         return True
@@ -369,6 +429,21 @@ async def push_with_retry(item: FeedItem, dry_run: bool = False) -> bool:
         # Small delay between firms
         await asyncio.sleep(0.5)
 
+    if any_success:
+        # Only now — after a confirmed successful delivery — do we mark this
+        # URL as seen. Previously the scrapers marked URLs seen immediately
+        # after scraping, before any push was attempted, so a failed push
+        # (e.g. a rejected request, a network error) permanently blacklisted
+        # the item with nothing ever delivered to MutemoOS, and it would
+        # never be retried on a later run.
+        #
+        # LawsAfricaItem is a special case: lawsafrica.py checks
+        # state.is_seen(frbr_uri), not is_seen(url) like every other
+        # scraper — so it must be marked seen under frbr_uri, or the
+        # dedup would silently never take effect for this source.
+        seen_key = item.frbr_uri if isinstance(item, LawsAfricaItem) else item.url
+        state.mark_seen(seen_key)
+
     return any_success
 
 
@@ -382,6 +457,7 @@ async def push_batch(items: list[FeedItem], dry_run: bool = False) -> dict:
         valid, reason = validate_item(item)
         if not valid:
             logger.warning(f"[pusher] Skipping invalid item: {reason}")
+            state.increment_skipped()
             skipped += 1
             continue
 

@@ -237,8 +237,11 @@ async def run(dry_run: bool = False) -> list[JudgmentItem]:
             logger.info(
                 f"[DRY RUN] Would push: {item.case_name} ({item.citation}) — {url}"
             )
-        else:
-            state.mark_seen(url)
+        # mark_seen() now happens in pusher.py, only after a push succeeds —
+        # previously it ran here right after scraping, so a failed push
+        # (e.g. PDF download blocked by Cloudflare, then the backend
+        # rejecting the metadata-only request) permanently blacklisted the
+        # judgment with nothing ever delivered to MutemoOS.
 
         new_items.append(item)
 

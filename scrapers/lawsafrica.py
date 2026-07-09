@@ -172,8 +172,7 @@ async def run(dry_run: bool = False) -> list[LawsAfricaItem]:
         if item:
             if dry_run:
                 logger.info(f"[DRY RUN] Would push judgment: {item.title}")
-            else:
-                state.mark_seen(frbr_uri)
+            # mark_seen() now happens in pusher.py, only after a push succeeds.
             new_items.append(item)
 
     # Fetch recent legislation
@@ -190,8 +189,7 @@ async def run(dry_run: bool = False) -> list[LawsAfricaItem]:
             if item:
                 if dry_run:
                     logger.info(f"[DRY RUN] Would push legislation: {item.title}")
-                else:
-                    state.mark_seen(frbr_uri)
+                # mark_seen() now happens in pusher.py, only after a push succeeds.
                 new_items.append(item)
 
     state.set_last_scraped("lawsafrica")

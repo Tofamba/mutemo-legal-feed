@@ -129,11 +129,23 @@ class NewsItem:
     scraped_at: Optional[object] = None  # datetime set at scrape time
 
 
-async def _scrape_source(source: dict, dry_run: bool = False) -> list[NewsItem]:
-    """Scrape a single news source and return relevant NewsItems."""
+async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[int] = None) -> list[NewsItem]:
+    """
+    Scrape a single news source and return relevant NewsItems.
+
+    `max_new` is the remaining shared budget across all sources for this run
+    — passed in by run() so a single high-volume source (NewsDay, Herald)
+    can't consume the whole per-run cap on its own. Falls back to the full
+    per-run cap if not given (e.g. when called standalone/manually).
+    """
     name = source["name"]
     listing_url = source["listing_url"]
     article_pattern = source["article_pattern"]
+
+    if max_new is None:
+        max_new = state.get_max_new_per_run()
+    if max_new <= 0:
+        return []
 
     logger.info(f"[news/{name}] Scraping listing: {listing_url}")
     try:
@@ -161,7 +173,6 @@ async def _scrape_source(source: dict, dry_run: bool = False) -> list[NewsItem]:
     logger.info(f"[news/{name}] Found {len(unique_urls)} article URLs")
 
     items: list[NewsItem] = []
-    max_new = state.get_max_new_per_run()
 
     for url in unique_urls:
         if len(items) >= max_new:
@@ -207,8 +218,12 @@ async def _scrape_source(source: dict, dry_run: bool = False) -> list[NewsItem]:
 
         if dry_run:
             logger.info(f"[DRY RUN] Would push news: {title} — {url}")
-        else:
-            state.mark_seen(url)
+        # NOTE: mark_seen() is no longer called here. It used to run right
+        # after a successful scrape, before the item was ever pushed to
+        # MutemoOS — so a failed push (e.g. a backend rejecting the request)
+        # permanently blacklisted the URL with nothing ever delivered.
+        # mark_seen() now happens in pusher.py, only after a push actually
+        # succeeds.
 
         items.append(item)
 
@@ -219,13 +234,23 @@ async def run(dry_run: bool = False) -> list[NewsItem]:
     """
     Main entry point. Scrapes all news sources and returns new legal NewsItems.
     Each source is scraped sequentially to avoid rate-limiting.
+
+    MAX_NEW_PER_RUN is a shared budget across all 6 sources, not a per-source
+    cap — otherwise a high-volume source (NewsDay, Herald) could consume the
+    full cap on its own before lower-volume sources ever get checked, and the
+    real per-run total could run as high as 6x the configured max.
     """
     logger.info(f"[news] Starting scrape (dry_run={dry_run})")
     all_items: list[NewsItem] = []
+    remaining = state.get_max_new_per_run()
 
     for source in NEWS_SOURCES:
-        items = await _scrape_source(source, dry_run=dry_run)
+        if remaining <= 0:
+            logger.info("[news] Per-run budget exhausted — skipping remaining sources")
+            break
+        items = await _scrape_source(source, dry_run=dry_run, max_new=remaining)
         all_items.extend(items)
+        remaining -= len(items)
 
     state.set_last_scraped("news")
     logger.info(f"[news] Done. {len(all_items)} new legal news items.")

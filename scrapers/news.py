@@ -210,8 +210,18 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
         is_first_request = False
 
         # Scrape the article
+        # only_main_content=False (raw markdown, no PruningContentFilter):
+        # we found in production that the content filter was scoring the
+        # site's shared nav/boilerplate as higher-value than the actual
+        # article body, stripping the real unique text out entirely and
+        # leaving nearly-identical leftover content (nav + a "Latest News"
+        # widget) across every article page — which looked exactly like a
+        # caching bug (byte-identical "content" across different URLs) but
+        # was actually a content-extraction setting the whole time. Raw
+        # markdown is noisier (includes nav/footer text) but guarantees
+        # genuinely unique, real per-page content.
         try:
-            article_md = await scrape_markdown(url, proxy="basic", wait_ms=500)
+            article_md = await scrape_markdown(url, proxy="basic", wait_ms=500, only_main_content=False)
         except FirecrawlError as e:
             logger.warning(f"[news/{name}] Failed to scrape {url}: {e}")
             continue
@@ -251,7 +261,13 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
         date_m = RE_DATE.search(article_md)
         doc_date = date_m.group(1).strip() if date_m else None
 
-        summary = article_md[:800].strip()
+        # Summary should start at the real article heading, not the raw
+        # start of the page — with only_main_content=False (raw markdown),
+        # every page starts with the same nav/masthead boilerplate before
+        # ever reaching the actual article, same as it did in fit_markdown,
+        # just now we keep the real content that comes after it too.
+        summary_start = title_m.start() if title_m else 0
+        summary = article_md[summary_start:summary_start + 800].strip()
 
         item = NewsItem(
             url=url,

@@ -164,6 +164,14 @@ async def scrape_page(
         }
 
         logger.info(f"[crawl4ai] ✓ Scraped {url} ({len(markdown)} chars)")
+        # Temporary diagnostic — we've hit a case where every scrape past
+        # the first returns identical LENGTH content, and two independent
+        # fix attempts (cache-busting, request pacing) both had zero effect.
+        # Logging an actual content snippet (not just length) lets us see
+        # directly what's being returned, rather than continuing to guess
+        # blindly at the cause.
+        snippet = markdown[:200].replace("\n", " ") if markdown else "(empty)"
+        logger.info(f"[crawl4ai] snippet for {url}: {snippet}")
         return {"markdown": markdown, "metadata": metadata}
 
     except FirecrawlError:

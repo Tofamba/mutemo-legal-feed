@@ -83,13 +83,20 @@ def _get_run_config(only_main_content: bool, wait_ms: int) -> "CrawlerRunConfig"
         ) if only_main_content else None,
     )
     return CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,  # always fresh — no stale cache
+        cache_mode=CacheMode.BYPASS,  # bypasses Crawl4AI's own internal cache only —
+        # does NOT affect any CDN/edge cache the target site itself sits
+        # behind (e.g. Cloudflare). That's a separate layer entirely, and
+        # is what the Cache-Control/Pragma headers below are for.
         markdown_generator=md_generator,
         wait_until="domcontentloaded",
         page_timeout=30000,  # ms
         delay_before_return_html=wait_ms / 1000 if wait_ms > 0 else 0,
         remove_overlay_elements=True,
         simulate_user=True,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+        },
     )
 
 
@@ -121,9 +128,21 @@ async def scrape_page(
     browser_config = _get_browser_config(proxy)
     run_config     = _get_run_config(only_main_content, wait_ms)
 
+    # Belt-and-suspenders against CDN/edge caching on the target site itself
+    # (separate from Crawl4AI's own cache, and separate from whether the
+    # target's CDN even honors Cache-Control/Pragma headers — some CDN page
+    # rules ignore client cache-control hints entirely). Appending a unique
+    # query param changes the actual cache key, which most CDNs key on by
+    # full URL+query — this forces a cache miss regardless of header
+    # handling. The clean, original url is preserved everywhere else
+    # (metadata, dedup, storage) — only the navigation target gets busted.
+    import time
+    cache_bust_sep = "&" if "?" in url else "?"
+    fetch_url = f"{url}{cache_bust_sep}_cb={int(time.time() * 1000)}"
+
     try:
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await crawler.arun(url=url, config=run_config)
+            result = await crawler.arun(url=fetch_url, config=run_config)
 
         if not result.success:
             raise FirecrawlError(

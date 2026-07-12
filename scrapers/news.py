@@ -23,6 +23,7 @@ Strategy:
 Credit budget: 1 credit/listing × 6 sources + 1 credit/article × up to 10 = ~16 credits/run
 """
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -173,6 +174,15 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
     logger.info(f"[news/{name}] Found {len(unique_urls)} article URLs")
 
     items: list[NewsItem] = []
+    # Guards against a specific failure mode we found in production: a CDN/
+    # edge cache in front of the news site (independent of Crawl4AI's own
+    # cache_mode setting, which only controls Crawl4AI's local cache) can
+    # serve the same cached page for every URL requested, regardless of
+    # path. That silently produces N "different" articles that are actually
+    # all identical content from one specific page. Two different URLs
+    # scraped in the same run should never legitimately produce byte-
+    # identical content — if they do, something upstream is stale.
+    seen_content_hashes: set = set()
 
     for url in unique_urls:
         if len(items) >= max_new:
@@ -191,6 +201,18 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
 
         if not article_md or len(article_md) < 100:
             continue
+
+        content_hash = hashlib.sha256(article_md.encode("utf-8")).hexdigest()
+        if content_hash in seen_content_hashes:
+            logger.warning(
+                f"[news/{name}] Skipping {url} — content is byte-identical to another "
+                f"article already scraped this run. This usually means a CDN/edge cache "
+                f"in front of the site served a stale/wrong page for this URL, not that "
+                f"the article is a real duplicate — not pushing to avoid storing wrong "
+                f"content under the wrong headline."
+            )
+            continue
+        seen_content_hashes.add(content_hash)
 
         # Filter by legal keywords
         if not _is_legal_content(article_md):

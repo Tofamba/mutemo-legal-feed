@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from firecrawl_client import scrape_markdown, FirecrawlError
+from firecrawl_client import scrape_markdown, scrape_page, FirecrawlError
 import state
 
 logger = logging.getLogger(__name__)
@@ -221,7 +221,9 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
         # markdown is noisier (includes nav/footer text) but guarantees
         # genuinely unique, real per-page content.
         try:
-            article_md = await scrape_markdown(url, proxy="basic", wait_ms=500, only_main_content=False)
+            page = await scrape_page(url, proxy="basic", wait_ms=500, only_main_content=False)
+            article_md = page.get("markdown", "")
+            page_title = (page.get("metadata") or {}).get("title", "").strip()
         except FirecrawlError as e:
             logger.warning(f"[news/{name}] Failed to scrape {url}: {e}")
             continue
@@ -249,14 +251,26 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
             continue
 
         title_m = RE_TITLE.search(article_md)
-        # Fallback when no markdown heading matches: use the LAST url segment
-        # (the readable slug), not the second-to-last — for URLs like
-        # .../article/200058187/high-court-blocks-development-.../ the
-        # second-to-last segment is just the numeric article ID, not
-        # anything resembling a headline. rstrip("/") first in case the
-        # URL has a trailing slash, which would otherwise make the last
-        # segment an empty string.
-        title = title_m.group(1).strip() if title_m else url.rstrip("/").split("/")[-1].replace("-", " ").title()
+        # Prefer the page's own <title> metadata over regex-matching a
+        # markdown heading — with only_main_content=False (raw markdown),
+        # the FIRST heading-like element on the page is often a category
+        # breadcrumb (e.g. "## [Local News](url)") rather than the actual
+        # article title, which sits further down. The <title> tag doesn't
+        # have that ambiguity. Strip the common " - SiteName" / " | SiteName"
+        # suffix most sites append. Falls back to the markdown heading, then
+        # the URL slug, if metadata title is missing for some reason.
+        if page_title:
+            title = re.sub(rf"\s*[-|]\s*{re.escape(name)}.*$", "", page_title, flags=re.IGNORECASE).strip()
+        elif title_m:
+            title = title_m.group(1).strip()
+        else:
+            # Fallback: use the LAST url segment (the readable slug), not
+            # the second-to-last — for URLs like .../article/200058187/
+            # high-court-blocks-development-.../ the second-to-last segment
+            # is just the numeric article ID, not anything resembling a
+            # headline. rstrip("/") first in case the URL has a trailing
+            # slash, which would otherwise make the last segment empty.
+            title = url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
         date_m = RE_DATE.search(article_md)
         doc_date = date_m.group(1).strip() if date_m else None

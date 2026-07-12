@@ -85,18 +85,19 @@ def _get_run_config(only_main_content: bool, wait_ms: int) -> "CrawlerRunConfig"
     return CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,  # bypasses Crawl4AI's own internal cache only —
         # does NOT affect any CDN/edge cache the target site itself sits
-        # behind (e.g. Cloudflare). That's a separate layer entirely, and
-        # is what the Cache-Control/Pragma headers below are for.
+        # behind (e.g. Cloudflare). That's a separate layer entirely.
+        # NOTE: this pinned crawl4ai version (0.6.3) does not support a
+        # `headers=` kwarg on CrawlerRunConfig (added in later releases) —
+        # tried it, got TypeError: unexpected keyword argument 'headers'.
+        # Relying on the cache-busting query param in scrape_page() instead,
+        # which works independent of crawl4ai's API surface/version since
+        # it's just URL string manipulation, not a config option.
         markdown_generator=md_generator,
         wait_until="domcontentloaded",
         page_timeout=30000,  # ms
         delay_before_return_html=wait_ms / 1000 if wait_ms > 0 else 0,
         remove_overlay_elements=True,
         simulate_user=True,
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-        },
     )
 
 

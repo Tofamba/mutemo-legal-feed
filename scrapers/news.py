@@ -23,8 +23,10 @@ Strategy:
 Credit budget: 1 credit/listing × 6 sources + 1 credit/article × up to 10 = ~16 credits/run
 """
 
+import asyncio
 import hashlib
 import logging
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -183,6 +185,7 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
     # scraped in the same run should never legitimately produce byte-
     # identical content — if they do, something upstream is stale.
     seen_content_hashes: set = set()
+    is_first_request = True
 
     for url in unique_urls:
         if len(items) >= max_new:
@@ -191,6 +194,20 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
         if state.is_seen(url):
             state.increment_skipped()
             continue
+
+        # Rapid-fire requests (no delay at all previously) are a classic
+        # bot-detection trigger. We saw exactly this pattern in production:
+        # the first request or two would succeed with real content, then
+        # every subsequent request — even with a cache-busting URL that
+        # guarantees a unique request — returned identical content back.
+        # That rules out simple CDN URL-keyed caching; a soft rate-limit
+        # or anti-bot measure silently falling back to a cached "last good"
+        # response fits the evidence much better. Pacing requests with a
+        # randomized delay (not a fixed interval, which is itself a bot
+        # signature) gives the site less reason to treat this as abuse.
+        if not is_first_request:
+            await asyncio.sleep(random.uniform(3.0, 6.0))
+        is_first_request = False
 
         # Scrape the article
         try:

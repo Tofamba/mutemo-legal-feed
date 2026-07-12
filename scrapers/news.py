@@ -249,30 +249,21 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
                 state.mark_seen(url)  # mark as seen so we don't check again
             continue
 
-        # metadata['title'] turned out unreliable in production — it
-        # returned the category name ("Local News") for every article, not
-        # the actual headline, so we don't use it. Instead, find the first
-        # heading that ISN'T itself just a markdown link — a breadcrumb like
-        # "## [Local News](url)" is a heading whose entire text is a single
-        # link; a real article title is plain text. This distinguishes them
-        # without depending on Crawl4AI's metadata extraction at all.
-        title = None
-        for heading_text in RE_TITLE.findall(article_md):
-            heading_text = heading_text.strip()
-            if re.fullmatch(r"\[.+\]\(.+\)", heading_text):
-                continue  # entire heading is just a link — a breadcrumb, not a title
-            title = heading_text
-            break
-        if not title:
-            # Fallback: use the LAST url segment (the readable slug), not
-            # the second-to-last — for URLs like .../article/200058187/
-            # high-court-blocks-development-.../ the second-to-last segment
-            # is just the numeric article ID, not anything resembling a
-            # headline. rstrip("/") first in case the URL has a trailing
-            # slash, which would otherwise make the last segment empty.
-            title = url.rstrip("/").split("/")[-1].replace("-", " ").title()
+        # Heading-based title extraction has failed three separate ways in
+        # production: matched a numeric URL ID, matched a category
+        # breadcrumb link, then matched the site's shared "GET OUR
+        # NEWSLETTER" footer heading (plain text, so it passed the
+        # link-skip filter that fixed the breadcrumb case). Three distinct
+        # failure modes in three attempts is a sign the approach itself
+        # isn't reliable for this site's markup, not that it needs one more
+        # special case. The URL slug has been completely reliable through
+        # this whole investigation — always article-specific, never
+        # generic — so it's now the primary source instead of a fallback.
+        # rstrip("/") first in case of a trailing slash, which would
+        # otherwise make the last segment empty.
+        title = url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
-        title_m = RE_TITLE.search(article_md)  # kept for the summary-start heuristic below
+        title_m = RE_TITLE.search(article_md)  # kept only for the summary-start heuristic below
         date_m = RE_DATE.search(article_md)
         doc_date = date_m.group(1).strip() if date_m else None
 

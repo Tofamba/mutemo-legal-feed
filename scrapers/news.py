@@ -223,7 +223,6 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
         try:
             page = await scrape_page(url, proxy="basic", wait_ms=500, only_main_content=False)
             article_md = page.get("markdown", "")
-            page_title = (page.get("metadata") or {}).get("title", "").strip()
         except FirecrawlError as e:
             logger.warning(f"[news/{name}] Failed to scrape {url}: {e}")
             continue
@@ -250,20 +249,21 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
                 state.mark_seen(url)  # mark as seen so we don't check again
             continue
 
-        title_m = RE_TITLE.search(article_md)
-        # Prefer the page's own <title> metadata over regex-matching a
-        # markdown heading — with only_main_content=False (raw markdown),
-        # the FIRST heading-like element on the page is often a category
-        # breadcrumb (e.g. "## [Local News](url)") rather than the actual
-        # article title, which sits further down. The <title> tag doesn't
-        # have that ambiguity. Strip the common " - SiteName" / " | SiteName"
-        # suffix most sites append. Falls back to the markdown heading, then
-        # the URL slug, if metadata title is missing for some reason.
-        if page_title:
-            title = re.sub(rf"\s*[-|]\s*{re.escape(name)}.*$", "", page_title, flags=re.IGNORECASE).strip()
-        elif title_m:
-            title = title_m.group(1).strip()
-        else:
+        # metadata['title'] turned out unreliable in production — it
+        # returned the category name ("Local News") for every article, not
+        # the actual headline, so we don't use it. Instead, find the first
+        # heading that ISN'T itself just a markdown link — a breadcrumb like
+        # "## [Local News](url)" is a heading whose entire text is a single
+        # link; a real article title is plain text. This distinguishes them
+        # without depending on Crawl4AI's metadata extraction at all.
+        title = None
+        for heading_text in RE_TITLE.findall(article_md):
+            heading_text = heading_text.strip()
+            if re.fullmatch(r"\[.+\]\(.+\)", heading_text):
+                continue  # entire heading is just a link — a breadcrumb, not a title
+            title = heading_text
+            break
+        if not title:
             # Fallback: use the LAST url segment (the readable slug), not
             # the second-to-last — for URLs like .../article/200058187/
             # high-court-blocks-development-.../ the second-to-last segment
@@ -272,6 +272,7 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
             # slash, which would otherwise make the last segment empty.
             title = url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
+        title_m = RE_TITLE.search(article_md)  # kept for the summary-start heuristic below
         date_m = RE_DATE.search(article_md)
         doc_date = date_m.group(1).strip() if date_m else None
 

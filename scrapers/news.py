@@ -94,7 +94,7 @@ RE_DATE  = re.compile(
     r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|"
     r"August|September|October|November|December)\s+\d{4})\b"
 )
-RE_TITLE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+RE_TITLE = re.compile(r"^#{1,3}\s+(.+)$", re.MULTILINE)
 
 # Exclude navigation/utility links
 EXCLUDE_PATTERNS = [
@@ -200,7 +200,14 @@ async def _scrape_source(source: dict, dry_run: bool = False, max_new: Optional[
             continue
 
         title_m = RE_TITLE.search(article_md)
-        title = title_m.group(1).strip() if title_m else url.split("/")[-2].replace("-", " ").title()
+        # Fallback when no markdown heading matches: use the LAST url segment
+        # (the readable slug), not the second-to-last — for URLs like
+        # .../article/200058187/high-court-blocks-development-.../ the
+        # second-to-last segment is just the numeric article ID, not
+        # anything resembling a headline. rstrip("/") first in case the
+        # URL has a trailing slash, which would otherwise make the last
+        # segment an empty string.
+        title = title_m.group(1).strip() if title_m else url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
         date_m = RE_DATE.search(article_md)
         doc_date = date_m.group(1).strip() if date_m else None

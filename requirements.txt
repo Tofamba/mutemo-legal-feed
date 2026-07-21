@@ -6,3 +6,5 @@ python-dotenv==1.0.0
 pytz
 pdfplumber==0.11.0
 pypdf==4.3.1
+anthropic>=0.40.0
+

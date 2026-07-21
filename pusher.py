@@ -29,6 +29,14 @@ Validation Gate:
   Every item is validated before push. Items that fail validation are
   logged and skipped — they never enter MutemoOS's database.
 
+AI Relevance Filter:
+  News items only. After structural validation, a Haiku call decides
+  whether the article is actually about Zimbabwean law/courts/legislation
+  before it's pushed. Rejected items are marked seen (so they're never
+  re-scraped or re-analyzed) but never pushed. On API error, defaults to
+  True (relevant) — a filter outage should never silently suppress a real
+  legal update.
+
 Retry policy:
   3 attempts with exponential backoff: 5s, 15s, 45s per firm.
   On final failure, logs to state.push_failures for audit.
@@ -44,6 +52,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import httpx
+import anthropic
 
 import state
 from scrapers.zimlii import JudgmentItem
@@ -54,6 +63,9 @@ from scrapers.zlhr import ZLHRItem
 from scrapers.lawsafrica import LawsAfricaItem
 
 logger = logging.getLogger(__name__)
+
+# Initialize Anthropic client for the relevance filter
+ai_client = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 MAX_RETRIES  = 3
 RETRY_DELAYS = [5, 15, 45]   # seconds between attempts
@@ -122,6 +134,36 @@ def _load_firms() -> list[FirmConfig]:
 
 # Load at module startup
 FIRMS: list[FirmConfig] = _load_firms()
+
+
+# ── AI Relevance Filter ───────────────────────────────────────────────────────
+
+async def is_legally_relevant(item: NewsItem) -> bool:
+    """
+    Uses Claude 3.5 Haiku to filter out non-legal news noise.
+    News items only — ZLHR/judgments/legislation/Laws.Africa are never
+    noisy in the way general news sources are, so they skip this gate
+    entirely and go straight to the structural validation result.
+    Returns True if relevant, False otherwise.
+    """
+    # Combine title and lede for classification context
+    sample_text = f"TITLE: {item.title}\nTEXT: {item.markdown_summary[:1000]}"
+
+    try:
+        resp = await ai_client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=10,
+            messages=[{
+                "role": "user",
+                "content": f"Is this article about Zimbabwean law, courts, legislation, legal procedure, or lawyers' work? Answer YES or NO only.\n\n{sample_text}"
+            }]
+        )
+        verdict = resp.content[0].text.strip().upper()
+        return "YES" in verdict
+    except Exception as e:
+        logger.error(f"[pusher] AI relevance filter error: {e}")
+        # Default to True on error so we don't accidentally drop important news
+        return True
 
 
 # ── Validation Gate ───────────────────────────────────────────────────────────
@@ -483,6 +525,7 @@ async def push_batch(items: list[FeedItem], dry_run: bool = False) -> dict:
     skipped = 0
 
     for item in items:
+        # 1. Structural Validation (Existing Gate)
         valid, reason = validate_item(item)
         if not valid:
             logger.warning(f"[pusher] Skipping invalid item: {reason}")
@@ -490,6 +533,18 @@ async def push_batch(items: list[FeedItem], dry_run: bool = False) -> dict:
             skipped += 1
             continue
 
+        # 2. AI Relevance Filter (News only)
+        if isinstance(item, NewsItem):
+            relevant = await is_legally_relevant(item)
+            if not relevant:
+                logger.info(f"[pusher] AI Filter: Dropping non-legal news: {item.title}")
+                # Mark as seen so it's not re-scraped/re-analyzed, but never pushed.
+                state.mark_seen(item.url)
+                state.increment_skipped()
+                skipped += 1
+                continue
+
+        # 3. Execution (Network Push)
         success = await push_with_retry(item, dry_run=dry_run)
         if success:
             pushed += 1
@@ -498,5 +553,5 @@ async def push_batch(items: list[FeedItem], dry_run: bool = False) -> dict:
 
         await asyncio.sleep(1)
 
-    logger.info(f"[pusher] Batch complete: {pushed} pushed, {failed} failed, {skipped} skipped (validation)")
+    logger.info(f"[pusher] Batch complete: {pushed} pushed, {failed} failed, {skipped} skipped (validation/filter)")
     return {"pushed": pushed, "failed": failed, "skipped": skipped, "total": len(items)}

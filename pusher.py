@@ -213,8 +213,15 @@ async def _push_zlr_entry(item: Union[JudgmentItem, DigestItem],
         else:
             resp = await client.post(url, data=form_data, headers=_build_headers(firm))
 
-        if resp.status_code in (200, 201):
-            logger.info(f"[pusher/{firm.name}] ✓ ZLR pushed: {item.url}")
+        if resp.status_code in (200, 201, 202):
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if body.get("status") == "duplicate":
+                logger.info(f"[pusher/{firm.name}] Already have: {item.url}")
+            else:
+                logger.info(f"[pusher/{firm.name}] ✓ ZLR pushed: {item.url}")
             return True
         else:
             logger.warning(f"[pusher/{firm.name}] ZLR push failed {resp.status_code}: {resp.text[:200]}")
@@ -248,8 +255,23 @@ async def _push_news_item(item: NewsItem,
 
     try:
         resp = await client.post(url, data=form_data, headers=_build_headers(firm))
-        if resp.status_code in (200, 201):
-            logger.info(f"[pusher/{firm.name}] ✓ News pushed: {item.url}")
+        # MutemoOS's upload endpoints are async/background-processing by
+        # design and return 202 for genuine success — this previously only
+        # checked for 200/201, meaning it never correctly recognized ANY
+        # successful push, new or duplicate. The data was landing correctly
+        # regardless (MutemoOS's own dedup is independent of what this
+        # function thinks happened), but every run was misreporting itself
+        # as having failed, and wasting 3 retries + delays per item for
+        # something that had already succeeded on the first attempt.
+        if resp.status_code in (200, 201, 202):
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if body.get("status") == "duplicate":
+                logger.info(f"[pusher/{firm.name}] Already have: {item.url}")
+            else:
+                logger.info(f"[pusher/{firm.name}] ✓ News pushed: {item.url}")
             return True
         else:
             logger.warning(f"[pusher/{firm.name}] News push failed {resp.status_code}: {resp.text[:200]}")
@@ -290,8 +312,15 @@ async def _push_legal_update(item: Union[LegislationItem, ZLHRItem],
         else:
             resp = await client.post(url, data=form_data, headers=_build_headers(firm))
 
-        if resp.status_code in (200, 201):
-            logger.info(f"[pusher/{firm.name}] ✓ Legal update pushed: {item.url}")
+        if resp.status_code in (200, 201, 202):
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if body.get("status") == "duplicate":
+                logger.info(f"[pusher/{firm.name}] Already have: {item.url}")
+            else:
+                logger.info(f"[pusher/{firm.name}] ✓ Legal update pushed: {item.url}")
             return True
         else:
             logger.warning(f"[pusher/{firm.name}] Legal update push failed {resp.status_code}: {resp.text[:200]}")
